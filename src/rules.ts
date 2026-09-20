@@ -220,6 +220,50 @@ export const TAR_CHECKPOINT = [
   /\btar\b[^|;&]*--checkpoint\s*=\s*\d+.*--checkpoint-action/i,
 ]
 
+// ============== Network tool detection ==============
+
+// matches these tools as whole words, case-insensitive:
+// curl, wget, ssh, scp, rsync, nc, ncat, nslookup, dig, ping,
+// tracert, traceroute, httpx, httpie
+export const NETWORK_TOOLS: RegExp =
+  /\b(curl|wget|ssh|scp|rsync|nc|ncat|nslookup|dig|ping|tracert|traceroute|httpx|httpie)\b/i
+
+// extract unique hosts from a command string.
+// sources:
+//   - http(s)://host patterns (extract the host portion, lowercased)
+//   - ssh invocations: any `@host` token found after `ssh` up to the next
+//     command separator. captures jump hosts (`-J user@host`) and
+//     multiple targets (`ssh user@host1 user@host2`).
+// returns [] if none. deduplicates.
+export function extractNetworkHosts(command: string): string[] {
+  if (!command) return []
+  const hosts = new Set<string>()
+  let m: RegExpExecArray | null
+
+  // 1) HTTP/HTTPS URLs
+  const urlRe = /https?:\/\/([^/\s?#:[\]]+)/gi
+  while ((m = urlRe.exec(command)) !== null) {
+    const host = m[1].toLowerCase().split(":")[0]
+    if (host) hosts.add(host)
+  }
+
+  // 2) ssh invocations: capture args until the next shell separator
+  //    (`;`, `&`, `|`, newline) or end of string. Then within those
+  //    args, pick up every `@host` token.
+  const sshInvRe = /\bssh\b([^\n;&|]*)/gi
+  while ((m = sshInvRe.exec(command)) !== null) {
+    const args = m[1]
+    const atRe = /@(\S+)/g
+    let am: RegExpExecArray | null
+    while ((am = atRe.exec(args)) !== null) {
+      const host = am[1].split(/[\s:"']/)[0].toLowerCase()
+      if (host) hosts.add(host)
+    }
+  }
+
+  return [...hosts]
+}
+
 // ============== Session state ==============
 
 export interface SessionState {
@@ -336,6 +380,36 @@ export function isSafe(normalizedInner: string): boolean {
   const frags = parts.filter((p) => !/^(;|&&|\|\||\|)$/.test(p))
   if (frags.length > 1) return frags.every(isSafeSingle)
   return isSafeSingle(normalizedInner)
+}
+
+// ============== Cached safe check ==============
+
+export interface SafeCacheOptions {
+  ttl?: number
+  max?: number
+}
+
+// module-level LRU+TTL cache shared across all isSafeCached calls.
+const safeCache = new Map<string, { result: boolean; expires: number }>()
+
+// same result as the existing isSafe(command) but with a module-level
+// LRU+TTL cache. cache is module-level and shared across calls.
+export function isSafeCached(command: string, options?: SafeCacheOptions): boolean {
+  const ttl = options?.ttl ?? 60_000
+  const max = options?.max ?? 1000
+  const key = shortHash(command)
+  const now = Date.now()
+  const hit = safeCache.get(key)
+  if (hit && hit.expires > now) return hit.result
+  const result = isSafe(command)
+  safeCache.set(key, { result, expires: now + ttl })
+  // evict oldest insertion if over max
+  while (safeCache.size > max) {
+    const oldest = safeCache.keys().next().value
+    if (oldest === undefined) break
+    safeCache.delete(oldest)
+  }
+  return result
 }
 
 export function redactSecrets(input: string): string {

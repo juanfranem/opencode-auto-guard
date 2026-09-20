@@ -31,10 +31,13 @@ import {
   HARD_DENY,
   HARD_ASK,
   ALWAYS_ASK,
+  NETWORK_TOOLS,
+  extractNetworkHosts,
   normalize,
   unwrap,
   includesAny,
   isSafe,
+  isSafeCached,
   redactSecrets,
   shortHash,
   isProtectedPath,
@@ -65,6 +68,21 @@ const DEFAULT_JUDGE_TIMEOUT_MS = 15_000
 
 // Genesis hash for the first entry of the audit chain.
 const GENESIS_HASH = "sha256:" + "0".repeat(64)
+
+// ============== Tunables ==============
+
+// Max LLM judge calls per session before throttling kicks in.
+const JUDGE_CALL_LIMIT_PER_SESSION = 20
+
+// Actions counted toward totalActions (and thus toward the per-session
+// maxActions limit). Read/list/no-effect actions are excluded so they
+// don't churn the counter.
+const COUNTED_ACTIONS = new Set(["bash", "edit", "write", "apply_patch", "webfetch", "websearch", "subagent"])
+
+// Audit log rotation: archive oldest entries when head exceeds this.
+const AUDIT_MAX_ENTRIES = 10_000
+// Keep this many recent entries after a rotation.
+const AUDIT_KEEP_RECENT = 5_000
 
 // ============== Types ==============
 
@@ -100,13 +118,16 @@ interface AuditEntry {
 
 const sessionState = new Map<string, SessionState>()
 
-function getOrInitSession(sessionID: string): SessionState {
+// Per-session LLM judge call counter for rate limiting.
+const judgeCallsBySession = new Map<string, number>()
+
+function getOrInitSession(sessionID: string, action: string): SessionState {
   let s = sessionState.get(sessionID)
   if (!s) {
     s = newSession()
     sessionState.set(sessionID, s)
   }
-  s.totalActions++
+  if (COUNTED_ACTIONS.has(action)) s.totalActions++
   return s
 }
 
@@ -209,6 +230,34 @@ async function writeAudit(ctx: any, partial: Omit<AuditEntry, "n" | "prevHash" |
     const entry: AuditEntry = { ...base, hash }
     await ctx.storage.set(`guard:audit-${String(n).padStart(10, "0")}`, entry)
     await ctx.storage.set("guard:audit-head", { n, hash })
+
+    // Audit log rotation: if head exceeds the cap, archive older entries.
+    if (n > AUDIT_MAX_ENTRIES) {
+      try {
+        const cutoff = n - AUDIT_KEEP_RECENT
+        const today = new Date().toISOString().slice(0, 10)
+        for (let i = 1; i <= cutoff; i++) {
+          const key = `guard:audit-${String(i).padStart(10, "0")}`
+          const archiveKey = `guard:audit-archive-${today}-${String(i).padStart(10, "0")}`
+          try {
+            const e = await ctx.storage.get(key)
+            if (e) await ctx.storage.set(archiveKey, e)
+          } catch {}
+          try {
+            await ctx.storage.remove(key)
+          } catch {}
+        }
+        try {
+          await ctx.storage.set("guard:audit-archive-pointer", {
+            archivedAt: new Date().toISOString(),
+            archivedUpTo: cutoff,
+            lastN: n,
+          })
+        } catch {}
+      } catch {
+        // best-effort rotation
+      }
+    }
   } catch {
     // best-effort
   }
@@ -321,7 +370,7 @@ export default Plugin.define({
         const sessionID: string = event.sessionID
         const agent: string | undefined = event.agent
 
-        const state = getOrInitSession(sessionID)
+        const state = getOrInitSession(sessionID, action)
 
         // Límites de sesión
         if (state.denials >= opts.maxDenials) {
@@ -390,6 +439,27 @@ export default Plugin.define({
             const inner = unwrap(resource)
             redactedResources.push(redactSecrets(resource).slice(0, 500))
 
+            // Network egress detection: any network tool pointing at an
+            // untrusted host -> ask. This catches things HARD_DENY/HARD_ASK
+            // already flag (curl/wget/ssh are in HARD_ASK) but also applies
+            // to npm publish/push-like flows the lists don't cover.
+            if (NETWORK_TOOLS.test(inner) || NETWORK_TOOLS.test(norm)) {
+              const hosts = extractNetworkHosts(resource)
+              for (const host of hosts) {
+                if (
+                  !isTrustedUrl("http://" + host, opts.trustedDomains) &&
+                  !isTrustedUrl("https://" + host, opts.trustedDomains)
+                ) {
+                  worst = worstDecision(worst, "ask")
+                  reason = reason || `${PLUGIN_NAME}: destino de red no confiable (${host})`
+                  await writeAudit(
+                    ctx,
+                    mkAudit(event, worst, "shell_network_untrusted", host, false, [resource]),
+                  )
+                }
+              }
+            }
+
             // HARD_DENY
             const denyHit = includesAny(norm, HARD_DENY) ?? includesAny(inner, HARD_DENY)
             if (denyHit) {
@@ -435,7 +505,7 @@ export default Plugin.define({
             }
 
             // Auto allowlist elevation (only auto agent)
-            if (agent === "auto" && originalEffect === "ask" && isSafe(inner)) {
+            if (agent === "auto" && originalEffect === "ask" && isSafeCached(inner)) {
               worst = worstDecision(worst, "allow")
               reason = reason || `${PLUGIN_NAME}: lectura segura verificada (allowlist Auto)`
               continue
@@ -451,14 +521,24 @@ export default Plugin.define({
             !reason.includes("lectura segura") &&
             !reason.includes("(fast)")
           ) {
-            const needsJudge = (event.resources as string[]).some((r) => !isSafe(unwrap(r)))
-            if (needsJudge) {
-              const verdict = await judgeWithLLM(ctx, opts.judgeModel, agent, event.resources as string[])
-              if (verdict) {
-                judged = true
-                if (verdict.decision === "deny") {
-                  worst = "deny"
-                  reason = `${PLUGIN_NAME}(juez): ${verdict.reason}`
+            const judgeCount = (judgeCallsBySession.get(sessionID) ?? 0) + 1
+            if (judgeCount > JUDGE_CALL_LIMIT_PER_SESSION) {
+              // Throttled: keep current worst (ask), audit the skip.
+              await writeAudit(
+                ctx,
+                mkAudit(event, event.effect, "judge_throttled", `calls=${judgeCount - 1}`, judged),
+              )
+            } else {
+              judgeCallsBySession.set(sessionID, judgeCount)
+              const needsJudge = (event.resources as string[]).some((r) => !isSafe(unwrap(r)))
+              if (needsJudge) {
+                const verdict = await judgeWithLLM(ctx, opts.judgeModel, agent, event.resources as string[])
+                if (verdict) {
+                  judged = true
+                  if (verdict.decision === "deny") {
+                    worst = "deny"
+                    reason = `${PLUGIN_NAME}(juez): ${verdict.reason}`
+                  }
                 }
               }
             }
@@ -529,6 +609,35 @@ export default Plugin.define({
           throw e
         }
         // Other errors: do not block the tool call.
+      }
+    })
+
+    // ====== Hook terciario: tool.execute.after (prompt injection defense) ======
+    // Wrap webfetch output from non-trusted URLs in <untrusted-source>...</...>
+    // so downstream LLMs can't be tricked by content that imitates system
+    // prompts. Trusted domains are left untouched.
+    await ctx.tool.hook("execute.after", async (input: any) => {
+      try {
+        if (input.tool !== "webfetch") return
+        if (input.status !== "completed") return
+        const url = String((input.input ?? {}).url ?? "")
+        if (!url) return
+        if (isTrustedUrl(url, opts.trustedDomains)) return
+        const r = input.result as { output?: string } | undefined
+        if (r && typeof r.output === "string") {
+          r.output = `<untrusted-source url="${url}">\n${r.output}\n</untrusted-source>`
+        }
+        await writeAudit(
+          ctx,
+          mkAudit(
+            { ...input, action: "webfetch", effect: "allow" },
+            "allow",
+            "webfetch_delimited",
+            `trusted=false`,
+          ),
+        )
+      } catch {
+        // best-effort
       }
     })
   },
