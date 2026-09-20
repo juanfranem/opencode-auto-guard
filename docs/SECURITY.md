@@ -32,6 +32,7 @@ defends against malicious tool calls that exploit over-permissive config.
 |                                           |
 | 1. Session limits                         |
 |    - maxDenials / maxActions / maxDuration|
+|    - Only risky actions are counted        |
 |                                           |
 | 2. Self-protection                        |
 |    - read/edit on plugin files -> deny    |
@@ -43,9 +44,12 @@ defends against malicious tool calls that exploit over-permissive config.
 |    a. Hard deny patterns                  |
 |    b. Hard ask patterns                   |
 |    c. Fast classifier (no LLM)            |
-|    d. LLM judge for ambiguous cases       |
-|    e. Per-agent escalation (build)        |
-|    f. Per-agent tightening (no auto-allow)|
+|    d. Network egress extraction           |
+|       (curl, wget, ssh, nc, ...)          |
+|    e. LLM judge for ambiguous cases       |
+|       - rate-limited per session          |
+|    f. Per-agent escalation (build)        |
+|    g. Per-agent tightening (no auto-allow)|
 +-------------------------------------------+
                   |
                   v
@@ -54,6 +58,15 @@ defends against malicious tool calls that exploit over-permissive config.
 |                                           |
 | - TOCTOU re-check via fs.realpath         |
 | - apply_patch protected-path scanning     |
++-------------------------------------------+
+                  |
+                  v
++-------------------------------------------+
+| opencode-auto-guard: tool.execute.after   |
+|                                           |
+| - Wrap webfetch output from non-trusted   |
+|   URLs in <untrusted-source> tags to      |
+|   defend against prompt injection         |
 +-------------------------------------------+
 ```
 
@@ -71,6 +84,11 @@ defends against malicious tool calls that exploit over-permissive config.
   `:(){:|:&};:`, `cacls`, `takeown`.
 - **Privileged operations**: `sudo`, `set-executionpolicy bypass`,
   `--privileged` Docker, `--network host`, volume mounts of `C:` or `/`.
+- **Network egress in shell**: any shell command using `curl`, `wget`, `ssh`,
+  `scp`, `rsync`, `nc`, `ncat`, `nslookup`, `dig`, `ping`, `tracert`,
+  `httpx`, `httpie` has its hosts (URLs and `user@host` patterns, including
+  jump hosts in `-J`) extracted and validated against `trustedDomains`.
+  Non-trusted hosts force `ask`.
 - **Path tampering**: the plugin's own files (config, source code, audit
   logs) cannot be read or modified by the agent session.
 - **Symlink swap (TOCTOU)**: the `tool.execute.before` hook re-checks the
@@ -78,9 +96,22 @@ defends against malicious tool calls that exploit over-permissive config.
 - **Prompt injection in URLs**: `webfetch` to non-trusted domains requires
   user confirmation. The agent sees the URL but cannot bypass the check by
   reformulating it.
+- **Prompt injection via webfetch content**: the `tool.execute.after` hook
+  wraps the output of non-trusted `webfetch` calls in
+  `<untrusted-source url="...">...</untrusted-source>` markers, signalling
+  to the agent that the content is data, not instructions.
 - **Repeated bypass attempts**: three consecutive denials pause the session.
-  250 actions or 30 minutes — same. The agent cannot grind through the
-  guard.
+  250 counted actions or 30 minutes — same. The agent cannot grind through
+  the guard. Counting is scoped to risky actions only (`bash`, `edit`,
+  `write`, `apply_patch`, `webfetch`, `websearch`, `subagent`) so that
+  benign read-only actions do not exhaust the budget.
+- **Cost attacks via LLM judge**: the LLM judge is rate-limited to 20 calls
+  per session. Beyond that, ambiguous cases fall back to `ask` directly
+  without consuming the judge budget.
+- **Audit log unbounded growth**: the hash-chained audit auto-rotates at
+  10,000 entries. Older entries are archived under
+  `guard:audit-archive-${date}-${n}` keys with a pointer record so the
+  chain can be reconstructed across rotations.
 
 ## What is NOT covered
 

