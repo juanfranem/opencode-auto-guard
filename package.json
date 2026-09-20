@@ -1,0 +1,37 @@
+{
+  "name": "opencode-auto-guard",
+  "version": "0.1.0",
+  "description": "Security guard plugin for OpenCode v2: classifies shell commands with a fast deterministic layer and an optional LLM judge, prevents path tampering, and signs plugin integrity.",
+  "license": "MIT",
+  "type": "module",
+  "main": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "keywords": [
+    "opencode",
+    "plugin",
+    "security",
+    "permissions",
+    "judge",
+    "ai-agent"
+  ],
+  "scripts": {
+    "test": "bun src/tests/evasion-test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": "^2.0.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.5.0"
+  },
+  "files": [
+    "src",
+    "agents",
+    "README.md",
+    "LICENSE",
+    "docs"
+  ]
+}
