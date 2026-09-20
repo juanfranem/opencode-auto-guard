@@ -287,6 +287,12 @@ export interface SessionState {
   contextPct: number;
   /** Anchor for incremental token estimation; undefined means no baseline yet. */
   contextBaseline?: ContextBaseline;
+  /**
+   * True once the context guard has fired the compact-context-guard skill
+   * for this session. Prevents the skill from being re-invoked on every
+   * subsequent denial while the session is paused.
+   */
+  contextCompactTriggered: boolean;
 }
 
 export function newSession(): SessionState {
@@ -297,6 +303,7 @@ export function newSession(): SessionState {
     contextTokens: 0,
     contextLimit: 0,
     contextPct: 0,
+    contextCompactTriggered: false,
   };
 }
 
@@ -695,4 +702,283 @@ const ORDER: Record<Decision, number> = { allow: 0, ask: 1, deny: 2 };
 
 export function worstDecision(a: Decision, b: Decision): Decision {
   return ORDER[a] >= ORDER[b] ? a : b;
+}
+
+// ============== Compact context guard skill ==============
+
+/**
+ * Stable identifier the plugin uses to invoke the skill via
+ * `ctx.session.skill({ sessionID, id: "compact-context-guard" })` and to
+ * register it via `ctx.skill.transform`. Keep in sync with
+ * `agents/compact-context-guard.md`.
+ */
+export const COMPACT_CONTEXT_GUARD_SKILL_ID = "compact-context-guard";
+
+/**
+ * Default location the plugin dumps per-session conversation archives
+ * and the agent writes refined compact documents to. Resolves to
+ *   ~/.config/opencode/opencode-auto-guard/sessions/
+ * matching the existing plugin convention.
+ */
+export function defaultCompactSessionsDir(): string {
+  return path.resolve(os.homedir(), ".config/opencode/opencode-auto-guard/sessions");
+}
+
+/**
+ * Stable identifier the plugin uses for the audit category when it
+ * auto-creates the temp directory on startup. Kept here (alongside the
+ * other category strings) so audit consumers can match on a single
+ * constant instead of grepping for the literal.
+ */
+export const TMP_DIR_AUDIT_CATEGORY = "temp_dir_ready";
+
+/**
+ * Default scratch directory the auto agent can use without asking for
+ * permission on every read/write. Resolves to
+ *   ~/.config/opencode/opencode-auto-guard/tmp/
+ *
+ * The directory is intentionally NOT in the protected-paths list —
+ * the guard considers it a known scratch area. The plugin creates it
+ * at startup so the agent does not have to. Subdirectories inside it
+ * are still subject to the regular per-action checks (self-protection,
+ * shell classification, network egress, etc.) — only the TMP root
+ * itself is granted the implicit "temp files live here" semantics.
+ */
+export function defaultTempDir(): string {
+  return path.resolve(os.homedir(), ".config/opencode/opencode-auto-guard/tmp");
+}
+
+export interface CompactContextSkillOptions {
+  /** Absolute base dir for session artifacts. Defaults to `~/.config/opencode/opencode-auto-guard/sessions`. */
+  sessionsDir?: string;
+  /** Session ID the skill is running against. Embedded in the prompt for traceability. */
+  sessionID?: string;
+  /** Token usage at the moment the guard fired, e.g. `"85000/200000"`. */
+  tokensAtPause?: string;
+  /** Fraction of the model context window reached, e.g. `"85%"`. */
+  contextPct?: string;
+  /** Absolute path to the raw conversation dump the plugin just wrote. */
+  rawDumpPath?: string;
+  /** ISO timestamp of when the guard fired. */
+  triggeredAt?: string;
+  /** Plugin version embedded in the compact template. */
+  pluginVersion?: string;
+}
+
+/**
+ * Build the prompt content for the `compact-context-guard` skill.
+ *
+ * The skill is invoked by the plugin when the context guard denies an
+ * action because the session is running out of context. Its job is to
+ * turn the current conversation into a small, well-structured markdown
+ * document the user can hand to a fresh session later.
+ *
+ * The skill prompt is split into a fixed base structure (known to the
+ * agent so it can keep filling it in across versions) and a variable
+ * block describing the current invocation (paths, timestamps, token
+ * counts). Pure so it can be unit-tested.
+ */
+export function buildCompactContextSkillPrompt(opts: CompactContextSkillOptions = {}): string {
+  const sessionsDir = opts.sessionsDir ?? defaultCompactSessionsDir();
+  const triggeredAt = opts.triggeredAt ?? new Date().toISOString();
+  const sessionID = opts.sessionID ?? "<session-id>";
+  const tokensAtPause = opts.tokensAtPause ?? "<tokens>/<limit>";
+  const contextPct = opts.contextPct ?? "<pct>%";
+  const rawDumpPath = opts.rawDumpPath ?? "<raw-dump-path>";
+  const pluginVersion = opts.pluginVersion ?? "<plugin-version>";
+  const compactPath = `${sessionsDir}/${sessionID}/compact-${stampForFilename(triggeredAt)}.md`;
+
+  return `# compact-context-guard
+
+The session context guard has paused this session because the model's context window is too full to safely keep going. The plugin has already:
+
+1. Denied the action that crossed the threshold.
+2. Dumped the full conversation history to a JSON file so you can read it without using more context.
+
+Your job: turn that dump into a small, structured compact document the user can load into a fresh session later.
+
+## What was paused
+
+- Session ID: \`${sessionID}\`
+- Triggered at: ${triggeredAt}
+- Context at pause: ${contextPct} (${tokensAtPause} tokens)
+- Reason: \`opencode-auto-guard\` \`context_limit\` denial
+
+## Where the artifacts go
+
+Base directory: \`${sessionsDir}\`
+
+- Per-session subdir: \`${sessionsDir}/${sessionID}/\`
+- Raw conversation dump (already written by the plugin): \`${rawDumpPath}\`
+- Refined compact (you write this): \`${compactPath}\`
+
+## What to do
+
+1. \`read\` the raw dump at \`${rawDumpPath}\`. It is a JSON array of session messages (user, assistant, tool calls, etc.) in chronological order.
+2. Parse out the meaningful content: the user's goal, the agent's plan, the key decisions, the files touched, and what is still pending.
+3. \`write\` a refined compact document to \`${compactPath}\` following the **Compact document structure** below. Fill in every section; if a section truly has no content, write \`None.\` instead of leaving it empty so the next agent does not have to guess.
+4. After writing, respond to the user with a one-line summary and the absolute path. Example: \`Compact saved to <path>. Open a fresh session and /load <path> to continue.\`
+5. Do not run any further shell, edit, or webfetch actions. The guard has paused the session; respect that and end your turn.
+
+## Compact document structure
+
+Use this template verbatim for the section headings — the next agent will recognise them.
+
+\`\`\`markdown
+# Compact Session: <short title, derived from the user's first message>
+
+> Compaction generated by \`opencode-auto-guard\` (compact-context-guard skill) on <iso timestamp>.
+> Session ID: <session-id>
+> Trigger: context guard paused session at <pct>% of model context window
+> Tokens at pause: <tokens>/<limit>
+
+## Original Goal
+
+What the user originally asked for. Written as if the user is explaining it to a fresh agent. One short paragraph.
+
+## Where We Are Now
+
+- ✅ Done: <what has been completed>
+- 🔄 In progress: <what is partially done>
+- ❌ Blocked: <what is stuck and why>
+- ⏭️ Next: <the very next concrete action>
+
+## Key Decisions Made
+
+1. **<decision>** — <rationale, why this choice over alternatives>
+2. ...
+
+## Files Touched
+
+- \`<path/to/file>\` — <what changed and why>
+- ...
+
+## Pending Questions / Blockers
+
+1. <question or blocker, written so the user can answer it without re-reading the whole session>
+2. ...
+
+## Recommended Next Steps
+
+1. <concrete step the next agent should do first>
+2. ...
+
+## Context the Next Agent Needs
+
+Files / URLs / docs / commands to read first to continue:
+- \`<path>\` — <why>
+- ...
+
+## Environment Notes
+
+- Model used: <provider/model>
+- Branch / commit: <git rev-parse HEAD> if available
+- Working directory: <pwd>
+- Plugin version: \`${pluginVersion}\`
+\`\`\`
+
+## Rules
+
+- Do not invent facts. If something is unknown, say so explicitly under **Pending Questions**.
+- Do not include raw secret material. The raw dump is the source of truth; the compact is a summary safe to paste into a new session.
+- Keep the compact under ~3 KB. The point is to recover context cheaply, not to mirror the dump.
+- If the raw dump is empty or unreadable, write a minimal compact that says so under **Where We Are Now** and list what you can infer from the system prompt under **Original Goal**.
+`;
+}
+
+/**
+ * Filename-safe timestamp derived from an ISO string. Used to make
+ * stable, sortable paths for raw dumps and compact documents.
+ */
+function stampForFilename(iso: string): string {
+  // Strip characters Windows / POSIX both reject in filenames.
+  return iso.replace(/[:.]/g, "-").replace(/Z$/, "Z");
+}
+
+/**
+ * Build the **Compact document structure** template as a standalone
+ * string. Exposed so tests can assert the headings and so other agents
+ * (e.g. the user manually loading a compact) can render an empty
+ * template.
+ */
+export function buildCompactDocumentTemplate(): string {
+  return `# Compact Session: <short title, derived from the user's first message>
+
+> Compaction generated by \`opencode-auto-guard\` (compact-context-guard skill) on <iso timestamp>.
+> Session ID: <session-id>
+> Trigger: context guard paused session at <pct>% of model context window
+> Tokens at pause: <tokens>/<limit>
+
+## Original Goal
+
+<One short paragraph explaining what the user wanted.>
+
+## Where We Are Now
+
+- ✅ Done: <what has been completed>
+- 🔄 In progress: <what is partially done>
+- ❌ Blocked: <what is stuck and why>
+- ⏭️ Next: <the very next concrete action>
+
+## Key Decisions Made
+
+1. **<decision>** — <rationale>
+2. ...
+
+## Files Touched
+
+- \`<path/to/file>\` — <what changed and why>
+- ...
+
+## Pending Questions / Blockers
+
+1. <question or blocker>
+2. ...
+
+## Recommended Next Steps
+
+1. <concrete step>
+2. ...
+
+## Context the Next Agent Needs
+
+- \`<path>\` — <why>
+- ...
+
+## Environment Notes
+
+- Model used: <provider/model>
+- Branch / commit: <git rev-parse HEAD if available>
+- Working directory: <pwd>
+- Plugin version: <opencode-auto-guard version>
+`;
+}
+
+/**
+ * Compute the per-session subdirectory the plugin uses for raw dumps
+ * and the agent uses for the refined compact.
+ */
+export function sessionCompactDir(sessionsDir: string, sessionID: string): string {
+  return path.join(sessionsDir, sessionID);
+}
+
+/**
+ * Compute the path the plugin writes the raw conversation dump to
+ * when the context guard fires. Filename-safe across platforms.
+ */
+export function rawDumpPath(sessionsDir: string, sessionID: string, isoTs: string): string {
+  return path.join(
+    sessionCompactDir(sessionsDir, sessionID),
+    `raw-${stampForFilename(isoTs)}.json`,
+  );
+}
+
+/**
+ * Compute the path the agent writes the refined compact document to.
+ */
+export function compactDocumentPath(sessionsDir: string, sessionID: string, isoTs: string): string {
+  return path.join(
+    sessionCompactDir(sessionsDir, sessionID),
+    `compact-${stampForFilename(isoTs)}.md`,
+  );
 }

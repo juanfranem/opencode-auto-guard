@@ -22,6 +22,7 @@ by default: when in doubt, deny.
 | Shell — strong judge (optional) | LLM call for ambiguous cases. Can only **deny** or keep **ask**. Never **allow**. Rate-limited to 20 calls per session. |
 | Per-agent policy | In `build`/`plan`, the plugin **never** elevates `ask → allow`. Only the `auto` agent gets allowlist-driven auto-approval. |
 | Session limits | 3 denials / 250 counted actions → session pauses. Plus context-based: pauses when the main agent's context reaches 60% of the model's context window (or your `maxContextUsage`). Risky actions (`bash`, `edit`, `write`, `apply_patch`, `webfetch`, `websearch`, `subagent`) are counted; read-only actions are not. |
+| Context handoff | When the context guard fires, the plugin dumps the conversation to disk and auto-invokes the `compact-context-guard` skill, which writes a structured markdown handoff so the user can continue in a fresh session. See [Context handoff](#context-handoff-compact-context-guard). |
 | Audit | Hash-chained tamper-evident log of every decision. Auto-rotates at 10,000 entries (keeps 5,000 most recent + archives older). |
 | TOCTOU | `tool.execute.before` hook re-checks file paths via `realpath` to detect symlink swap. |
 | `isSafeCached` | Module-level LRU+TTL cache (default 60s, 1000 entries) for `isSafe()` results — reduces CPU on repeated safe commands. |
@@ -81,6 +82,9 @@ All options are optional. Defaults are conservative.
 | `maxActions` | number | `250` | Session pauses after this many counted actions. |
 | `maxContextUsage` | number | `0.6` | Pause when the main agent's context reaches this fraction of the model's context window (0–1). 0 disables. |
 | `maxDurationMs` | number | `0` | Legacy time-based pause. 0 disables. Use `maxContextUsage` instead. |
+| `compactSessionsDir` | string | `~/.config/opencode/opencode-auto-guard/sessions` | Where the `compact-context-guard` skill writes its raw dumps and refined handoff documents. |
+| `compactOnContextGuard` | boolean | `true` | When the context guard fires, dump the conversation and auto-invoke the `compact-context-guard` skill in the paused session. Set `false` to disable. |
+| `tempDir` | string | `~/.config/opencode/opencode-auto-guard/tmp` | Scratch directory the auto agent uses for intermediate output (compiled artefacts, test fixtures, logs). Created on plugin startup; not in the protected-paths list. |
 | `pin` | string | unset | SHA-256 of `index.ts` + `rules.ts`. If set and mismatch → plugin disables. |
 
 ## Get the current pin
@@ -101,11 +105,72 @@ $combined = [System.BitConverter]::ToString((
 Set the result as `options.pin`. If someone replaces either file, the plugin
 won't register and OpenCode will silently fall back to your base permissions.
 
+## Context handoff (compact-context-guard)
+
+Long sessions run out of context. When that happens the guard denies
+the offending action and, by default, also asks OpenCode to activate a
+skill called `compact-context-guard` so the user can keep going in a
+fresh session without losing the thread.
+
+What the plugin does when the context guard fires:
+
+1. **Deny** the action that crossed `maxContextUsage`.
+2. **Dump** the conversation: `ctx.session.context({ sessionID })` is
+   serialised to
+   `~/.config/opencode/opencode-auto-guard/sessions/<session-id>/raw-<timestamp>.json`.
+3. **Rewrite** the registered skill's `content` with the concrete paths
+   and timestamps for this invocation.
+4. **Invoke** the skill via `ctx.session.skill({ sessionID, id: "compact-context-guard" })`.
+
+What the skill does (read by the agent on its next turn):
+
+1. `read` the raw dump.
+2. `write` a refined markdown compact to
+   `~/.config/opencode/opencode-auto-guard/sessions/<session-id>/compact-<timestamp>.md`.
+3. Tell the user the absolute path of the compact.
+
+The refined compact follows a fixed structure the next agent
+recognises so it can pick the work back up cheaply:
+
+- `# Compact Session: <title>` + metadata blockquote
+- `## Original Goal`
+- `## Where We Are Now` (✅ done / 🔄 in progress / ❌ blocked / ⏭️ next)
+- `## Key Decisions Made`
+- `## Files Touched`
+- `## Pending Questions / Blockers`
+- `## Recommended Next Steps`
+- `## Context the Next Agent Needs`
+- `## Environment Notes`
+
+Disable the auto-invoke with `compactOnContextGuard: false`, or change
+the output directory with `compactSessionsDir`. The plugin still
+registers the skill (and ships a standalone `agents/compact-context-guard.md`)
+so you can invoke it manually with `compact-context-guard` at any time.
+
+The skill is invoked once per session — once the guard has fired, the
+plugin stops re-invoking it on subsequent denials while the session
+stays paused. If the user wants a fresher compact, they can run the
+skill again manually.
+
 ## Agent: Auto mode
 
 The package ships an agent definition at `agents/auto.md`. OpenCode v2 does
 not allow plugins to register agents via `ctx.agent.transform` (no `add`
 method on `AgentEditor`), so you need to install it manually.
+
+The auto agent has a known scratch directory:
+
+```
+~/.config/opencode/opencode-auto-guard/tmp/
+```
+
+The plugin creates it on startup. Use it for compiled artefacts, test
+fixtures, intermediate logs — anything that has to live on disk but is
+not part of the user's project. Subdirectories inside it are still
+subject to the regular per-action checks (self-protection, shell
+classification, network egress); only the TMP root itself gets the
+implicit "temp files live here" semantics. See `agents/auto.md` for
+the rules the auto agent follows when writing there.
 
 **One-time setup**:
 

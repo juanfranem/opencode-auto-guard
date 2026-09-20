@@ -49,6 +49,12 @@ import {
   fastClassifyShell,
   estimateTokens,
   buildSetupWizardPrompt,
+  buildCompactContextSkillPrompt,
+  COMPACT_CONTEXT_GUARD_SKILL_ID,
+  defaultCompactSessionsDir,
+  defaultTempDir,
+  rawDumpPath,
+  TMP_DIR_AUDIT_CATEGORY,
   type Decision,
   type SessionState,
 } from "./rules";
@@ -114,6 +120,16 @@ interface ResolvedOptions {
   /** 0 disables time-based pause. */
   maxDurationMs: number;
   pin?: string;
+  /** Base dir for compact-context-guard artifacts (raw dump + compact docs). */
+  compactSessionsDir: string;
+  /** When true (default), the context guard auto-invokes the compact skill. */
+  compactOnContextGuard: boolean;
+  /**
+   * Scratch directory the auto agent can use without asking for
+   * permission on every read/write. Created on plugin startup.
+   * Not in the protected-paths list — treated as known temp area.
+   */
+  tempDir: string;
 }
 
 interface AuditEntry {
@@ -178,6 +194,15 @@ function resolveOptions(ctx: any): ResolvedOptions {
     maxContextUsage: readNumber(o.maxContextUsage, DEFAULT_LIMITS.maxContextUsage),
     maxDurationMs: readNumber(o.maxDurationMs, DEFAULT_LIMITS.maxDurationMs),
     pin: typeof o.pin === "string" ? o.pin : undefined,
+    compactSessionsDir:
+      typeof o.compactSessionsDir === "string" && o.compactSessionsDir.length > 0
+        ? path.resolve(o.compactSessionsDir)
+        : defaultCompactSessionsDir(),
+    compactOnContextGuard: readBool(o.compactOnContextGuard, true),
+    tempDir:
+      typeof o.tempDir === "string" && o.tempDir.length > 0
+        ? path.resolve(o.tempDir)
+        : defaultTempDir(),
   };
 }
 
@@ -403,6 +428,31 @@ export default Plugin.define({
     const integrity = await verifySelfIntegrity(ctx, opts.pin);
     if (!integrity) return;
 
+    // 1.5) Pre-create the temp scratch directory so the auto agent can
+    //      rely on it without checking or asking. Best-effort: a
+    //      permission failure here is logged but does not block the
+    //      plugin from registering (the dir may live elsewhere).
+    try {
+      await fs.mkdir(opts.tempDir, { recursive: true });
+      await writeAudit(
+        ctx,
+        mkAudit(
+          {
+            sessionID: "<setup>",
+            agent: undefined,
+            action: "setup",
+            effect: "allow",
+            resources: [opts.tempDir],
+          },
+          "allow",
+          TMP_DIR_AUDIT_CATEGORY,
+          `path=${opts.tempDir}`,
+        ),
+      );
+    } catch {
+      // best-effort
+    }
+
     // ====== Hook principal: permission.evaluate ======
     await ctx.permission.hook("evaluate", async (event: any) => {
       try {
@@ -444,6 +494,24 @@ export default Plugin.define({
               `tokens=${state.contextTokens}/${state.contextLimit}`,
             ),
           );
+
+          // Auto-invoke the compact-context-guard skill once per session
+          // so the agent can write a small markdown handoff to
+          // [compactSessionsDir]/<session-id>/compact-<ts>.md. The skill
+          // is idempotent in the plugin (one-shot) but the agent can be
+          // re-run later if the user wants to regenerate the compact.
+          if (opts.compactOnContextGuard && !state.contextCompactTriggered) {
+            state.contextCompactTriggered = true;
+            try {
+              await triggerCompactContextGuard(ctx, sessionID, state, opts);
+              await writeAudit(
+                ctx,
+                mkAudit(event, "deny", "context_limit_compact_triggered", `session=${sessionID}`),
+              );
+            } catch {
+              // best-effort: skill activation must never crash the guard
+            }
+          }
           return;
         }
         if (opts.maxDurationMs > 0 && Date.now() - state.startTime > opts.maxDurationMs) {
@@ -807,8 +875,112 @@ export default Plugin.define({
         },
       });
     });
+
+    // ====== Skill: compact-context-guard (auto-invoked on context pause) ======
+    // Register an embedded skill so the plugin can trigger it via
+    // ctx.session.skill({ sessionID, id: COMPACT_CONTEXT_GUARD_SKILL_ID })
+    // when the context guard fires. The skill's `content` is a default
+    // template; the plugin will rewrite the most recent instance with
+    // invocation-specific paths/timestamps before triggering it.
+    await ctx.skill.transform(async (editor: any) => {
+      editor.add({
+        id: COMPACT_CONTEXT_GUARD_SKILL_ID,
+        name: "Compact Context Guard",
+        description:
+          "Triggered by opencode-auto-guard when the model context window is too full. " +
+          "Reads the raw conversation dump the plugin just wrote and produces a structured " +
+          "markdown compact document so the user can continue in a fresh session.",
+        autoinvoke: false,
+        path: path.resolve(
+          os.homedir(),
+          ".config/opencode/opencode-auto-guard/skills/compact-context-guard.md",
+        ),
+        content: buildCompactContextSkillPrompt({
+          sessionsDir: opts.compactSessionsDir,
+          pluginVersion: PLUGIN_VERSION,
+        }),
+      });
+    });
   },
 });
+
+// ============== Compact-context-guard helpers ==============
+
+/**
+ * Best-effort: dump the current session's message history to disk and
+ * then ask OpenCode to activate the compact-context-guard skill in the
+ * session. The skill is what actually writes the refined compact; we
+ * only persist the raw dump so the agent can read it without consuming
+ * more context.
+ *
+ * Designed to never throw: any failure (storage missing, session
+ * already gone, API version drift) is swallowed so the guard's primary
+ * deny decision still stands.
+ */
+async function triggerCompactContextGuard(
+  ctx: any,
+  sessionID: string,
+  state: SessionState,
+  opts: ResolvedOptions,
+): Promise<void> {
+  const triggeredAt = new Date().toISOString();
+  const rawPath = rawDumpPath(opts.compactSessionsDir, sessionID, triggeredAt);
+
+  // 1. Dump the conversation history (best-effort). If this fails the
+  //    skill is still triggered; the agent will see a missing dump and
+  //    fall back to summarising from its own context.
+  try {
+    const messages = await ctx.session.context({ sessionID });
+    const serialised = JSON.stringify(
+      {
+        sessionID,
+        triggeredAt,
+        plugin: PLUGIN_NAME,
+        pluginVersion: PLUGIN_VERSION,
+        tokensAtPause: `${state.contextTokens}/${state.contextLimit}`,
+        contextPct: `${(state.contextPct * 100).toFixed(0)}%`,
+        messages: Array.isArray(messages) ? messages : [],
+      },
+      null,
+      2,
+    );
+    await fs.mkdir(path.dirname(rawPath), { recursive: true });
+    await fs.writeFile(rawPath, serialised, "utf8");
+  } catch {
+    // Dump failure is non-fatal. The skill will still activate.
+  }
+
+  // 2. Rewrite the registered skill's content with invocation-specific
+  //    paths so the agent sees concrete filenames instead of placeholders.
+  try {
+    await ctx.skill.transform(async (editor: any) => {
+      editor.update(COMPACT_CONTEXT_GUARD_SKILL_ID, (skill: any) => {
+        skill.content = buildCompactContextSkillPrompt({
+          sessionsDir: opts.compactSessionsDir,
+          sessionID,
+          tokensAtPause: `${state.contextTokens}/${state.contextLimit}`,
+          contextPct: `${(state.contextPct * 100).toFixed(0)}%`,
+          rawDumpPath: rawPath,
+          triggeredAt,
+          pluginVersion: PLUGIN_VERSION,
+        });
+      });
+    });
+  } catch {
+    // Skill rewrite is best-effort; even without it the agent can still
+    // discover the default paths from the registered content.
+  }
+
+  // 3. Activate the skill in the session. The session inbox enqueues it
+  //    and the agent picks it up on its next turn, where it follows the
+  //    instructions to produce the refined compact markdown.
+  try {
+    await ctx.session.skill({ sessionID, id: COMPACT_CONTEXT_GUARD_SKILL_ID });
+  } catch {
+    // Activation failure is non-fatal: the user can still run the skill
+    // manually with the raw dump on disk.
+  }
+}
 
 // ============== Helpers ==============
 
