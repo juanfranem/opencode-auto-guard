@@ -8,3 +8,6 @@ dist/
 .env.local
 *.tsbuildinfo
 coverage/
+
+# dev-only helpers used to stage split commits during plugin work
+scripts/

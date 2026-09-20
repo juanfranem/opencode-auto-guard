@@ -10,7 +10,9 @@
   },
   "keywords": ["opencode", "plugin", "security", "permissions", "judge", "ai-agent"],
   "scripts": {
-    "test": "bun src/tests/evasion-test.ts",
+    "test": "bun src/tests/evasion-test.ts && bun src/tests/compact-test.ts",
+    "test:evasion": "bun src/tests/evasion-test.ts",
+    "test:compact": "bun src/tests/compact-test.ts",
     "typecheck": "tsc --noEmit",
     "lint": "biome lint .",
     "lint:fix": "biome lint --write .",
@@ -21,6 +23,9 @@
   },
   "peerDependencies": {
     "@opencode/plugin": "^2.0.0"
+  },
+  "overrides": {
+    "@opentelemetry/core": ">=2.8.0"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.0",
