@@ -84,6 +84,11 @@ jobs:
       contents: read
       actions: read
       checks: read
+    # Code scanning is currently disabled at the repo level
+    # (Settings → Code security and analysis → Code scanning). Once the
+    # owner enables it, drop this `continue-on-error` and CodeQL will
+    # become a hard check.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
