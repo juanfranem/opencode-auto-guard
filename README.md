@@ -185,6 +185,29 @@ Out of scope by design. Combine with OS-level isolation for full coverage:
 
 See [`docs/SECURITY.md`](docs/SECURITY.md) for the full security model.
 
+## Commands
+
+### `/auto-guard-setup`
+
+Interactive wizard that walks you through the plugin configuration and
+writes the result back to `opencode.jsonc`. The agent asks the questions
+one at a time using its native `question` tool, previews the new options,
+then uses `read` + `edit` to update your config in place.
+
+Questions asked:
+
+1. LLM judge (yes / no, default yes)
+2. Judge model (if Q1 = yes; `provider/model`, e.g. `anthropic/claude-sonnet-4-5`)
+3. Strict build mode (yes / no, default yes)
+4. Context usage limit (0.0–1.0, default `0.6`)
+5. Max denials (default `3`)
+6. Max actions (default `250`)
+7. Extra trusted domains (comma-separated, optional)
+8. Pin the plugin SHA-256 (advanced, default no)
+
+After confirmation, the wizard shows the diff, writes the file, and reminds
+you to restart opencode (options are read at startup).
+
 ## Development
 
 ```bash

@@ -347,6 +347,64 @@ export function estimateTokens(messages: ReadonlyArray<unknown>): number {
   return Math.ceil(chars / CHARS_PER_TOKEN);
 }
 
+// ============== Setup wizard ==============
+
+export interface SetupWizardOptions {
+  /** Absolute path to the user's opencode.jsonc. */
+  configPath?: string;
+  /** Optional snapshot of the current options to weave into the prompt. */
+  currentOptions?: Record<string, unknown>;
+}
+
+const DEFAULT_WIZARD_CONFIG_PATH = "~/.config/opencode/opencode.jsonc";
+
+/**
+ * Build the instruction prompt the agent reads when the user invokes
+ * `/auto-guard-setup`. The agent uses its native `question` tool to
+ * walk the user through the wizard, then `read` + `edit` to update
+ * `opencode.jsonc`.
+ *
+ * The function is pure so it can be unit-tested: tests assert that the
+ * output mentions every required question, the defaults, and the
+ * post-collection steps.
+ */
+export function buildSetupWizardPrompt(opts: SetupWizardOptions = {}): string {
+  const configPath = opts.configPath ?? DEFAULT_WIZARD_CONFIG_PATH;
+  const currentBlock = opts.currentOptions
+    ? `\n## Current options (for context)\n\n\`\`\`jsonc\n${JSON.stringify(opts.currentOptions, null, 2)}\n\`\`\`\n`
+    : "";
+
+  return `The user just ran \`/auto-guard-setup\`. Walk them through configuring the opencode-auto-guard plugin interactively.
+
+Use the \`question\` tool to ask the questions below **one at a time**, in order. After each answer, accept "default" or silence as the documented default. When you have all the answers, write the new options back to \`${configPath}\` using \`read\` + \`edit\`.
+${currentBlock}
+## Questions
+
+1. **LLM judge**: enable the LLM judge? It catches ambiguous cases the fast classifier cannot, but costs API tokens. \`yes\` / \`no\`, default \`yes\`.
+2. **Judge model** (only if Q1 = yes): which model? Format \`provider/model\`, e.g. \`anthropic/claude-sonnet-4-5\`. Say "default" to use the opencode default model.
+3. **Strict build mode**: should the build agent force \`ask\` for terraform / aws / kubectl / \`npm publish\` / ssh / scp / rsync? \`yes\` / \`no\`, default \`yes\`.
+4. **Context usage limit**: at what fraction of the model context window should the session pause? Range 0.0–1.0. \`0.6\` means pause at 60%. Default \`0.6\`.
+5. **Max denials**: after how many denials should the session pause? Default \`3\`.
+6. **Max actions**: after how many risky actions (bash / edit / write / webfetch / subagent) should the session pause? Default \`250\`.
+7. **Trusted domains**: extra domains to whitelist for webfetch? Comma-separated, optional. Say "none" to keep the built-in list (github.com, npm, pypi, crates.io, etc.).
+8. **Pin**: lock the plugin to its current SHA-256 so any tampering disables it? \`yes\` / \`no\`, default \`no\` for first-time setup.
+
+## After collecting answers
+
+1. Show the user a preview of the new options block before writing.
+2. Read \`${configPath}\` with the \`read\` tool.
+3. Locate the \`opencode-auto-guard\` entry in the \`plugins\` array and replace its \`options\` object. Preserve every other plugin and every other top-level key.
+4. If pin was enabled, compute it now:
+   - \`Get-FileHash "<plugin-dir>/src/index.ts" -Algorithm SHA256\`
+   - \`Get-FileHash "<plugin-dir>/src/rules.ts" -Algorithm SHA256\`
+   - Combined: \`[System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes("<index-hash>|<rules-hash>"))) -replace "-", ""\`
+   - Prefix with \`sha256:\` and store as \`options.pin\`.
+5. Write the file with the \`edit\` tool. Do not modify any other section.
+6. Confirm to the user with a one-line summary of what changed and remind them to restart opencode (the plugin only re-reads options on startup).
+
+If the user already has a \`pin\` set and wants to keep it, skip the recomputation. If they want to refresh it, run the calculation above regardless of the answer to Q8.`;
+}
+
 // ============== Secret patterns ==============
 
 export const SECRET_PATTERNS: RegExp[] = [

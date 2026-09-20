@@ -32,6 +32,7 @@ import {
   isSafeCached,
   estimateTokens,
   sumMessageChars,
+  buildSetupWizardPrompt,
 } from "../rules";
 
 let pass = 0;
@@ -454,6 +455,50 @@ ok(
   "matches sumMessageChars semantics",
   estimateTokens([{ text: "abcdef" }, { content: "ghij" }]) === 3, // 10 / 4 = 2.5 → 3
 );
+
+// =================== 10. Setup wizard prompt ===================
+
+section("buildSetupWizardPrompt — covers all required questions and steps");
+
+const prompt = buildSetupWizardPrompt();
+const promptCustom = buildSetupWizardPrompt({
+  configPath: "/tmp/custom.jsonc",
+  currentOptions: { judge: true },
+});
+
+ok("prompt is non-empty", prompt.length > 200);
+ok("mentions command name", prompt.includes("/auto-guard-setup"));
+ok(
+  "uses default config path when none provided",
+  prompt.includes("~/.config/opencode/opencode.jsonc"),
+);
+ok("uses provided config path", promptCustom.includes("/tmp/custom.jsonc"));
+ok("weaves in current options when provided", promptCustom.includes("Current options"));
+ok("omits current options block when not provided", !prompt.includes("Current options"));
+
+const requiredKeywords = [
+  ["LLM judge question", "LLM judge"],
+  ["judge model question", "Judge model"],
+  ["strict build question", "Strict build mode"],
+  ["context usage limit question", "Context usage limit"],
+  ["max denials question", "Max denials"],
+  ["max actions question", "Max actions"],
+  ["trusted domains question", "Trusted domains"],
+  ["pin question", "Pin"],
+  ["default 0.6 mention", "Default `0.6`"],
+  ["default 3 denials", "Default `3`"],
+  ["default 250 actions", "Default `250`"],
+  ["instruction to use question tool", "`question` tool"],
+  ["instruction to read config", "read"],
+  ["instruction to edit config", "edit"],
+  ["instruction to preserve other plugins", "Preserve every other plugin"],
+  ["powerShell hash instructions", "Get-FileHash"],
+  ["combined sha256 instructions", "ComputeHash"],
+  ["restart reminder", "restart"],
+] as const;
+for (const [name, kw] of requiredKeywords) {
+  ok(`wizard prompt contains: ${name}`, prompt.includes(kw), `keyword: "${kw}"`);
+}
 
 // =================== Summary ===================
 

@@ -48,6 +48,7 @@ import {
   worstDecision,
   fastClassifyShell,
   estimateTokens,
+  buildSetupWizardPrompt,
   type Decision,
   type SessionState,
 } from "./rules";
@@ -787,6 +788,24 @@ export default Plugin.define({
       } catch {
         // best-effort
       }
+    });
+
+    // ====== Comando: /auto-guard-setup (wizard de configuración) ======
+    // The description IS the prompt the agent reads when the user invokes
+    // the command. We generate it from a pure function so the questions,
+    // defaults, and post-collection steps can be unit-tested.
+    await ctx.command.transform(async (editor: any) => {
+      editor.add({
+        name: "auto-guard-setup",
+        description: buildSetupWizardPrompt({
+          configPath: `${os.homedir()}/.config/opencode/opencode.jsonc`,
+          currentOptions: opts as unknown as Record<string, unknown>,
+        }),
+        execute: async (_input: any) => {
+          // No-op. The description above drives the agent; we just need
+          // the command to be registered so the user can invoke it.
+        },
+      });
     });
   },
 });
