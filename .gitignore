@@ -1,6 +1,5 @@
 node_modules/
 bun.lockb
-bun.lock
 dist/
 *.log
 .DS_Store
@@ -8,6 +7,9 @@ dist/
 .env.local
 *.tsbuildinfo
 coverage/
+
+# bun.lock IS committed (Bun best practice): needed for reproducible
+# installs and for `bun audit` to work in CI.
 
 # dev-only helpers used to stage split commits during plugin work
 scripts/
