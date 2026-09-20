@@ -266,14 +266,85 @@ export function extractNetworkHosts(command: string): string[] {
 
 // ============== Session state ==============
 
+export interface ContextBaseline {
+  /** Real token count observed at the baseline anchor (e.g. after compaction). */
+  tokens: number;
+  /** Number of messages in the conversation at the baseline anchor. */
+  messagesLength: number;
+  /** Provider/model id at the baseline anchor, so model switches reset cleanly. */
+  modelKey: string;
+}
+
 export interface SessionState {
   denials: number;
   totalActions: number;
   startTime: number;
+  /** Last computed context usage in tokens (baseline + estimated delta). */
+  contextTokens: number;
+  /** Model's context window (in tokens) at the time of the last measurement. */
+  contextLimit: number;
+  /** contextTokens / contextLimit, in [0, 1]. 0 if limit unknown. */
+  contextPct: number;
+  /** Anchor for incremental token estimation; undefined means no baseline yet. */
+  contextBaseline?: ContextBaseline;
 }
 
 export function newSession(): SessionState {
-  return { denials: 0, totalActions: 0, startTime: Date.now() };
+  return {
+    denials: 0,
+    totalActions: 0,
+    startTime: Date.now(),
+    contextTokens: 0,
+    contextLimit: 0,
+    contextPct: 0,
+  };
+}
+
+// ============== Token estimation ==============
+
+/** Average chars per token used by the cheap estimator. Mixed English/code ~4. */
+const CHARS_PER_TOKEN = 4;
+
+/**
+ * Best-effort count of the textual content of a message.
+ * Accepts the loose shape OpenCode uses for messages: a string content,
+ * an array of parts with `text`/`content` fields, or anything else.
+ * Returns 0 for unknown shapes rather than throwing.
+ */
+export function sumMessageChars(msg: unknown): number {
+  if (!msg) return 0;
+  const m = msg as { content?: unknown; text?: unknown };
+  const c = m.content ?? m.text;
+  if (typeof c === "string") return c.length;
+  if (Array.isArray(c)) {
+    let total = 0;
+    for (const part of c) {
+      if (typeof part === "string") {
+        total += part.length;
+      } else if (part && typeof part === "object") {
+        const p = part as { text?: unknown; content?: unknown };
+        if (typeof p.text === "string") total += p.text.length;
+        if (typeof p.content === "string") total += p.content.length;
+      }
+    }
+    return total;
+  }
+  return 0;
+}
+
+/**
+ * Estimate the token count of a conversation by summing message chars
+ * and dividing by CHARS_PER_TOKEN. Returns 0 for empty input.
+ *
+ * This is an approximation: real tokenizers (cl100k, o200k) give
+ * ±20% error on mixed English/code. Good enough for context-budget
+ * guards where the threshold has slack.
+ */
+export function estimateTokens(messages: ReadonlyArray<unknown>): number {
+  if (!messages || messages.length === 0) return 0;
+  let chars = 0;
+  for (const m of messages) chars += sumMessageChars(m);
+  return Math.ceil(chars / CHARS_PER_TOKEN);
 }
 
 // ============== Secret patterns ==============

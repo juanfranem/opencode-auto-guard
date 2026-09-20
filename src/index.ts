@@ -47,6 +47,7 @@ import {
   newSession,
   worstDecision,
   fastClassifyShell,
+  estimateTokens,
   type Decision,
   type SessionState,
 } from "./rules";
@@ -61,7 +62,12 @@ export const PLUGIN_VERSION = "0.1.0";
 const DEFAULT_LIMITS = {
   maxDenials: 3,
   maxActions: 250,
-  maxDurationMs: 30 * 60 * 1000,
+  // Pause when the main agent's context reaches this fraction of the
+  // model's context window. 0 disables. The session is paused via the
+  // permission hook denying subsequent actions.
+  maxContextUsage: 0.6,
+  // Legacy: time-based pause. 0 disables. Kept as a fallback / opt-in.
+  maxDurationMs: 0,
 };
 
 const DEFAULT_JUDGE_TIMEOUT_MS = 15_000;
@@ -102,6 +108,9 @@ interface ResolvedOptions {
   protectedPaths: string[];
   maxDenials: number;
   maxActions: number;
+  /** 0 disables context-based pause. */
+  maxContextUsage: number;
+  /** 0 disables time-based pause. */
   maxDurationMs: number;
   pin?: string;
 }
@@ -165,6 +174,7 @@ function resolveOptions(ctx: any): ResolvedOptions {
     protectedPaths: readStringArray(o.protectedPaths) ?? defaultProtectedPaths(),
     maxDenials: readNumber(o.maxDenials, DEFAULT_LIMITS.maxDenials),
     maxActions: readNumber(o.maxActions, DEFAULT_LIMITS.maxActions),
+    maxContextUsage: readNumber(o.maxContextUsage, DEFAULT_LIMITS.maxContextUsage),
     maxDurationMs: readNumber(o.maxDurationMs, DEFAULT_LIMITS.maxDurationMs),
     pin: typeof o.pin === "string" ? o.pin : undefined,
   };
@@ -420,7 +430,22 @@ export default Plugin.define({
           );
           return;
         }
-        if (Date.now() - state.startTime > opts.maxDurationMs) {
+        if (opts.maxContextUsage > 0 && state.contextPct >= opts.maxContextUsage) {
+          event.effect = "deny";
+          event.message = `${PLUGIN_NAME}: contexto al ${(state.contextPct * 100).toFixed(0)}% ≥ ${(opts.maxContextUsage * 100).toFixed(0)}%`;
+          state.denials++;
+          await writeAudit(
+            ctx,
+            mkAudit(
+              event,
+              "deny",
+              "context_limit",
+              `tokens=${state.contextTokens}/${state.contextLimit}`,
+            ),
+          );
+          return;
+        }
+        if (opts.maxDurationMs > 0 && Date.now() - state.startTime > opts.maxDurationMs) {
           event.effect = "deny";
           event.message = `${PLUGIN_NAME}: sesión excedió ${opts.maxDurationMs / 60000} min`;
           await writeAudit(ctx, mkAudit(event, "deny", "session_limit", "duration"));
@@ -696,10 +721,116 @@ export default Plugin.define({
         // best-effort
       }
     });
+
+    // ====== Hook de sesión: context (medición de uso de tokens) ======
+    // Fires before each model call with the messages array and active model.
+    // We estimate token usage and store it for the permission hook to check.
+    await ctx.session.hook("context", async (event: any) => {
+      try {
+        const sessionID: string = event.sessionID;
+        const state = getOrInitSession(sessionID, "context");
+        const model = event.model as { providerID: string; modelID: string };
+        const modelKey = `${model.providerID}/${model.modelID}`;
+        const messages = (event.messages ?? []) as unknown[];
+
+        // Reuse baseline only when the model hasn't changed. On model
+        // switch, reset the anchor because token counts are not additive.
+        let baselineTokens = 0;
+        let baselineMessagesLength = 0;
+        if (state.contextBaseline?.modelKey === modelKey) {
+          baselineTokens = state.contextBaseline.tokens;
+          baselineMessagesLength = state.contextBaseline.messagesLength;
+        }
+
+        const newMessages = messages.slice(baselineMessagesLength);
+        const newTokens = estimateTokens(newMessages);
+        const totalTokens = baselineTokens + newTokens;
+
+        const limit = await lookupModelLimit(ctx, model.providerID, model.modelID);
+
+        state.contextBaseline = {
+          tokens: baselineTokens,
+          messagesLength: messages.length,
+          modelKey,
+        };
+        state.contextTokens = totalTokens;
+        state.contextLimit = limit;
+        state.contextPct = limit > 0 ? totalTokens / limit : 0;
+      } catch {
+        // best-effort
+      }
+    });
+
+    // ====== Hook de sesión: compaction (ancla de tokens reales) ======
+    // When OpenCode compacts the context, the result may carry a real
+    // TokenUsage.Info. Use it as the new baseline so subsequent deltas
+    // are added to an exact count rather than an estimate.
+    await ctx.session.hook("compaction", async (event: any) => {
+      try {
+        const sessionID: string = event.sessionID;
+        const result = event.result as { tokens?: TokenUsageLike } | undefined;
+        const tokens = result?.tokens;
+        if (!tokens) return;
+        const state = getOrInitSession(sessionID, "compaction");
+        const model = event.model as { providerID: string; modelID: string };
+        const total = totalFromTokenUsage(tokens);
+        const messages = (event.messages ?? []) as unknown[];
+        const limit = await lookupModelLimit(ctx, model.providerID, model.modelID);
+        state.contextBaseline = {
+          tokens: total,
+          messagesLength: messages.length,
+          modelKey: `${model.providerID}/${model.modelID}`,
+        };
+        state.contextTokens = total;
+        state.contextLimit = limit;
+        state.contextPct = limit > 0 ? total / limit : 0;
+      } catch {
+        // best-effort
+      }
+    });
   },
 });
 
 // ============== Helpers ==============
+
+/** Loose shape matching TokenUsage.Info — we don't pull in the schema package. */
+interface TokenUsageLike {
+  input: number;
+  output: number;
+  reasoning: number;
+  cache: { read: number; write: number };
+}
+
+/** Sum all token buckets. Mirrors TokenUsage.total from @opencode/schema. */
+function totalFromTokenUsage(t: TokenUsageLike): number {
+  return t.input + t.output + t.reasoning + t.cache.read + t.cache.write;
+}
+
+/**
+ * Look up the model's context window via ctx.model.list. The plugin API
+ * has no `get`; we filter the list ourselves. Returns 0 if unknown.
+ */
+async function lookupModelLimit(ctx: any, providerID: string, modelID: string): Promise<number> {
+  try {
+    const out = await ctx.model.list();
+    const list =
+      (
+        out as
+          | {
+              data?: ReadonlyArray<{
+                providerID?: string;
+                id?: string;
+                limit?: { context?: number };
+              }>;
+            }
+          | undefined
+      )?.data ?? [];
+    const hit = list.find((m) => m.providerID === providerID && m.id === modelID);
+    return hit?.limit?.context ?? 0;
+  } catch {
+    return 0;
+  }
+}
 
 function mkAudit(
   event: any,

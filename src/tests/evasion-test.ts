@@ -30,6 +30,8 @@ import {
   NETWORK_TOOLS,
   extractNetworkHosts,
   isSafeCached,
+  estimateTokens,
+  sumMessageChars,
 } from "../rules";
 
 let pass = 0;
@@ -404,6 +406,54 @@ const b = isSafeCached("git status");
 ok("misma llamada dos veces → ambas true (cache hit)", a === true && b === true, `a=${a} b=${b}`);
 
 ok("ttl:0 siempre recomputa → sigue siendo true", isSafeCached("git status", { ttl: 0 }));
+
+// =================== 9. Token estimation ===================
+
+section("sumMessageChars — extract textual content from message shapes");
+
+ok("string content", sumMessageChars({ content: "hello world" }) === 11);
+ok("text field fallback", sumMessageChars({ text: "abcde" }) === 5);
+ok("array of string parts", sumMessageChars({ content: ["foo", "bar", "baz"] }) === 9);
+ok(
+  "array of object parts with text",
+  sumMessageChars({ content: [{ text: "abc" }, { text: "defg" }] }) === 7,
+);
+ok(
+  "array of object parts with content",
+  sumMessageChars({ content: [{ content: "x" }, { content: "yy" }] }) === 3,
+);
+ok("null msg → 0", sumMessageChars(null) === 0);
+ok("undefined msg → 0", sumMessageChars(undefined) === 0);
+ok("missing content → 0", sumMessageChars({ role: "user" }) === 0);
+ok("unknown shape → 0", sumMessageChars({ content: { whatever: 42 } }) === 0);
+ok("nested content type", sumMessageChars({ content: [{ content: "ab" }, "rest"] }) === 6);
+
+section("estimateTokens — char/4 approximation");
+
+ok("empty list → 0", estimateTokens([]) === 0);
+ok("null → 0", estimateTokens(null as unknown as unknown[]) === 0);
+ok("1000 chars → 250 tokens", estimateTokens([{ content: "x".repeat(1000) }]) === 250);
+ok(
+  "empty messages with empty content → 0",
+  estimateTokens([{ content: "" }, { content: "" }]) === 0,
+);
+ok(
+  "sum across many messages",
+  estimateTokens([{ content: "abcd" }, { content: "efghij" }]) === 3, // 10 chars / 4 = 2.5 → 3
+);
+ok(
+  "rounds up partial tokens",
+  estimateTokens([{ content: "abc" }]) === 1, // 3 / 4 = 0.75 → 1
+);
+ok(
+  "rounds exact tokens",
+  estimateTokens([{ content: "abcd" }]) === 1, // 4 / 4 = 1
+);
+ok("100k chars → 25000 tokens", estimateTokens([{ content: "x".repeat(100_000) }]) === 25_000);
+ok(
+  "matches sumMessageChars semantics",
+  estimateTokens([{ text: "abcdef" }, { content: "ghij" }]) === 3, // 10 / 4 = 2.5 → 3
+);
 
 // =================== Summary ===================
 

@@ -21,7 +21,7 @@ by default: when in doubt, deny.
 | Shell — network egress | If a shell command uses `curl`, `wget`, `ssh`, `nc`, etc., the host is extracted and validated against `trustedDomains`. Non-trusted → **ask**. |
 | Shell — strong judge (optional) | LLM call for ambiguous cases. Can only **deny** or keep **ask**. Never **allow**. Rate-limited to 20 calls per session. |
 | Per-agent policy | In `build`/`plan`, the plugin **never** elevates `ask → allow`. Only the `auto` agent gets allowlist-driven auto-approval. |
-| Session limits | 3 denials / 250 counted actions / 30 min → session pauses. Only risky actions (`bash`, `edit`, `write`, `apply_patch`, `webfetch`, `websearch`, `subagent`) count. |
+| Session limits | 3 denials / 250 counted actions → session pauses. Plus context-based: pauses when the main agent's context reaches 60% of the model's context window (or your `maxContextUsage`). Risky actions (`bash`, `edit`, `write`, `apply_patch`, `webfetch`, `websearch`, `subagent`) are counted; read-only actions are not. |
 | Audit | Hash-chained tamper-evident log of every decision. Auto-rotates at 10,000 entries (keeps 5,000 most recent + archives older). |
 | TOCTOU | `tool.execute.before` hook re-checks file paths via `realpath` to detect symlink swap. |
 | `isSafeCached` | Module-level LRU+TTL cache (default 60s, 1000 entries) for `isSafe()` results — reduces CPU on repeated safe commands. |
@@ -78,8 +78,9 @@ All options are optional. Defaults are conservative.
 | `trustedDomains` | string[] | built-in list | Domains that pass through `webfetch`/`websearch` without asking. |
 | `protectedPaths` | string[] | plugin files | Absolute paths that are denied for `read`/`edit`/`write`. |
 | `maxDenials` | number | `3` | Session pauses after this many denials. |
-| `maxActions` | number | `250` | Session pauses after this many actions. |
-| `maxDurationMs` | number | `1800000` | Session pauses after this many ms. |
+| `maxActions` | number | `250` | Session pauses after this many counted actions. |
+| `maxContextUsage` | number | `0.6` | Pause when the main agent's context reaches this fraction of the model's context window (0–1). 0 disables. |
+| `maxDurationMs` | number | `0` | Legacy time-based pause. 0 disables. Use `maxContextUsage` instead. |
 | `pin` | string | unset | SHA-256 of `index.ts` + `rules.ts`. If set and mismatch → plugin disables. |
 
 ## Get the current pin
