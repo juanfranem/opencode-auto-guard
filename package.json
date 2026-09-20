@@ -8,30 +8,24 @@
   "exports": {
     ".": "./src/index.ts"
   },
-  "keywords": [
-    "opencode",
-    "plugin",
-    "security",
-    "permissions",
-    "judge",
-    "ai-agent"
-  ],
+  "keywords": ["opencode", "plugin", "security", "permissions", "judge", "ai-agent"],
   "scripts": {
     "test": "bun src/tests/evasion-test.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "lint": "biome lint .",
+    "lint:fix": "biome lint --write .",
+    "format": "biome format --write .",
+    "format:check": "biome format .",
+    "check": "bun run typecheck && bun run lint && bun run format:check && bun run test",
+    "audit": "bun audit"
   },
   "peerDependencies": {
     "@opencode/plugin": "^2.0.0"
   },
   "devDependencies": {
+    "@biomejs/biome": "^1.9.0",
     "@types/bun": "latest",
     "typescript": "^5.5.0"
   },
-  "files": [
-    "src",
-    "agents",
-    "README.md",
-    "LICENSE",
-    "docs"
-  ]
+  "files": ["src/index.ts", "src/rules.ts", "agents", "README.md", "LICENSE", "docs"]
 }
