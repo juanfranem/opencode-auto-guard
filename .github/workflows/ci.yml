@@ -8,6 +8,9 @@ on:
 
 permissions:
   contents: read
+  actions: read
+  checks: read
+  pull-requests: read
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -25,6 +28,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Force LF regardless of host OS. Without this, the Windows
+          # runner rewrites LF → CRLF on checkout and biome format --check
+          # (configured for LF) fails.
+          autocrlf: false
+          eol: lf
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -62,6 +71,9 @@ jobs:
     needs: ci
     steps:
       - uses: actions/checkout@v4
+        with:
+          autocrlf: false
+          eol: lf
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
@@ -78,8 +90,13 @@ jobs:
     permissions:
       security-events: write
       contents: read
+      actions: read
+      checks: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          autocrlf: false
+          eol: lf
       - uses: github/codeql-action/init@v3
         with:
           languages: typescript
