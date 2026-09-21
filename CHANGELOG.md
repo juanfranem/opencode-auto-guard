@@ -4,6 +4,12 @@ All notable changes to **opencode-auto-guard** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.1.1] — 2026-09-21
+
+### Fixed
+
+- **`/auto-guard-setup` command did nothing.** The wizard instructions lived in the command's `description`, under the (wrong) assumption that OpenCode v2 would inject `description` into the agent's prompt when the slash command runs. In reality OpenCode v2 only invokes `execute(input)`; `description` is help text in the picker. `execute` now calls `ctx.session.prompt(...)` to push the wizard instructions into the session as a real user prompt. The `description` is kept as a preview in the slash menu so the user can see the wizard text and copy it manually if the prompt endpoint is unavailable.
+
 ## [0.1.0] — 2026-09-21
 
 First public release.

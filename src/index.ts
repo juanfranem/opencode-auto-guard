@@ -62,7 +62,7 @@ import {
 // ============== Plugin metadata ==============
 
 export const PLUGIN_NAME = "opencode-auto-guard";
-export const PLUGIN_VERSION = "0.1.0";
+export const PLUGIN_VERSION = "0.1.1";
 
 // ============== Defaults ==============
 
@@ -1017,20 +1017,35 @@ export default Plugin.define({
       }
     });
 
-    // ====== Comando: /auto-guard-setup (wizard de configuración) ======
-    // The description IS the prompt the agent reads when the user invokes
-    // the command. We generate it from a pure function so the questions,
-    // defaults, and post-collection steps can be unit-tested.
+    // ====== Comando: /auto-guard-setup (wizard de configuración) =====
+    // OpenCode v2 does NOT auto-inject `description` into the agent's
+    // prompt when a slash command runs — only `execute(input)` runs, and
+    // `description` is just help text in the picker. So the wizard
+    // instructions live in `description` (so the user sees a preview in
+    // the slash menu) AND we push the same content into the session as a
+    // real prompt from `execute`. The wizard text is generated from a pure
+    // function so the questions, defaults, and post-collection steps can
+    // be unit-tested.
+    const wizardPrompt = buildSetupWizardPrompt({
+      configPath: `${os.homedir()}/.config/opencode/opencode.jsonc`,
+      currentOptions: opts as unknown as Record<string, unknown>,
+    });
     await ctx.command.transform(async (editor: any) => {
       editor.add({
         name: "auto-guard-setup",
-        description: buildSetupWizardPrompt({
-          configPath: `${os.homedir()}/.config/opencode/opencode.jsonc`,
-          currentOptions: opts as unknown as Record<string, unknown>,
-        }),
-        execute: async (_input: any) => {
-          // No-op. The description above drives the agent; we just need
-          // the command to be registered so the user can invoke it.
+        description: wizardPrompt,
+        execute: async (input: any) => {
+          try {
+            await ctx.session.prompt({
+              sessionID: input.sessionID,
+              text: { text: wizardPrompt },
+            } as never);
+          } catch {
+            // Best-effort: if the session is busy or the prompt endpoint
+            // is unavailable, fall through silently. The user can still
+            // copy the wizard text from the slash-menu description and
+            // paste it into the prompt manually.
+          }
         },
       });
     });
