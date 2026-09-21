@@ -1,0 +1,39 @@
+# Changelog
+
+All notable changes to **opencode-auto-guard** are documented here.
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and the project adheres to [Semantic Versioning](https://semver.org/).
+
+## [0.1.0] — 2026-09-21
+
+First public release.
+
+### Added
+
+- **Three-layer defense pipeline.** A pure-code fast classifier handles shell commands, webfetch, and file edits; network-domain validation runs as part of Layer 2; optional Layer 3 escalates ambiguous shell commands to a structured-decision judge (Jev) and then to an LLM judge. The LLM judge can **deny** or keep **ask** — it never promotes `ask → allow`.
+- **Self-integrity and self-protection.** The plugin refuses to register hooks when a configured `pin` (SHA-256 of `index.ts` + `rules.ts`) does not match the installed files. Reads, edits, writes, and `apply_patch` over the plugin's own files or over `opencode.jsonc` are denied outright.
+- **TOCTOU defence.** `tool.execute.before` re-checks file paths via `realpath` to detect symlink swap between read and write hooks.
+- **Trusted-domain policy.** Single `trustedDomains` list drives `webfetch`, `websearch`, and shell-network egress (`curl`, `wget`, `ssh`, `nc`, jump hosts in `-J`, `nslookup`). Non-trusted destinations prompt the user.
+- **Untrusted-source wrapping.** Output from non-trusted `webfetch` is wrapped in `<untrusted-source url="...">` so downstream turns treat it as data, not instructions.
+- **Per-agent policy.** `build` and `plan` agents never elevate `ask → allow`. Only the `auto` agent uses the deterministic allowlist for auto-approval.
+- **Session limits.** Session pauses after `3` denials, `250` counted actions, or when the main agent's context reaches `60 %` of the model window (configurable). Counted actions: `bash`, `edit`, `write`, `apply_patch`, `webfetch`, `websearch`, `subagent`. Read-only actions do not count.
+- **Context handoff via `compact-context-guard`.** When the context guard fires, the conversation is dumped to `~/.config/opencode/opencode-auto-guard/sessions/<session-id>/raw-<timestamp>.json` and the `compact-context-guard` skill writes a structured markdown handoff (`compact-<timestamp>.md`) so you can resume in a fresh session without losing the thread.
+- **`/auto-guard-setup` command.** Interactive wizard inside the agent that walks through every option one question at a time, previews the resulting `options` block, and writes it back to `opencode.jsonc` in place.
+- **`auto` agent definition.** Bundled at `agents/auto.md` with a known scratch directory at `~/.config/opencode/opencode-auto-guard/tmp/`, kept separate from the user's project. Subdirectories inside are still subject to the regular per-action checks.
+- **Audit log.** Hash-chained, tamper-evident log of every decision (allow / ask / deny). Auto-rotates at 10 000 entries, keeping the 5 000 most recent and archiving the rest.
+- **LRU+TTL cache for `isSafe()`.** `60 s` TTL, 1 000 entries — reduces CPU on repeated safe commands.
+- **Fast structured judge (Jev, optional).** Calls [OpenCode Zen's "system one" model](https://opencode.ai/docs/zen/) for ambiguous shell commands. ~70–500 ms, free during the OpenCode promo period, returns a typed verdict. Low-confidence and `unsure` cases fall through to the LLM judge. Tunable thresholds (`fastJudgeConfidenceDeny`, `fastJudgeConfidenceAsk`).
+- **Test suites.** `bun src/tests/evasion-test.ts` (shell pattern evasion), `bun src/tests/jev-test.ts` (fast judge), `bun src/tests/compact-test.ts` (context handoff).
+- **Dual publish.** Tag push → (a) GitHub Release with tarball + SHA-256 sidecar, (b) `npm.pkg.github.com` install path under `@juanfranem/opencode-auto-guard`.
+- **GitHub Actions.** Biome lint + format check + tests + CodeQL in CI; release workflow attaches signed artefacts to each GitHub Release.
+
+### Changed
+
+- Replaced the time-based session pause (`maxDurationMs`) with a context-based pause (`maxContextUsage`). `maxDurationMs` is kept as a `0`-disabled legacy alias.
+- `bun.lock` is now committed (Bun best practice — reproducible installs and `bun audit` in CI).
+- `package.json` `files` manifest narrowed to the runtime source tree (`src/index.ts`, `src/rules.ts`, `src/judge-fast.ts`), `agents/`, `README.md`, `LICENSE`, `docs/`. Tests and dev config are excluded from the published package.
+
+### Security
+
+- See [`docs/SECURITY.md`](docs/SECURITY.md) for the full threat model — what is enforced, what is **not** in scope (network-level exfiltration, filesystem isolation, credential scoping) and how to combine this plugin with OS-level isolation (`bwrap`, `sandbox-exec`, AppContainer, mount namespaces) for defence in depth.
+- Publishing is fingerprinted (`publishConfig.access = "public"`, scope `@juanfranem`) and GitHub Release artefacts are produced by an audited workflow.
