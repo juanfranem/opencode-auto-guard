@@ -1,3 +1,7 @@
+<p align="center">
+  <img alt="opencode-auto-guard — defensive permissions for autonomous coding agents, safe by default" src="assets/banner.svg" width="800" />
+</p>
+
 <div align="center">
 
 # opencode-auto-guard
