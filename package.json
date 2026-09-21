@@ -1,18 +1,42 @@
 {
-  "name": "opencode-auto-guard",
+  "name": "@juanfranem/opencode-auto-guard",
   "version": "0.1.0",
-  "description": "Security guard plugin for OpenCode v2: classifies shell commands with a fast deterministic layer and an optional LLM judge, prevents path tampering, and signs plugin integrity.",
+  "description": "Security guard plugin for OpenCode v2: classifies shell commands with a fast deterministic layer and an optional structured-decision (Jev) and LLM judge, prevents path tampering, and signs plugin integrity.",
   "license": "MIT",
   "type": "module",
   "main": "src/index.ts",
   "exports": {
     ".": "./src/index.ts"
   },
-  "keywords": ["opencode", "plugin", "security", "permissions", "judge", "ai-agent"],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "plugin",
+    "security",
+    "permissions",
+    "judge",
+    "ai-agent",
+    "prompt-injection",
+    "shell-guard",
+    "codeql"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/juanfranem/opencode-auto-guard.git"
+  },
+  "homepage": "https://github.com/juanfranem/opencode-auto-guard#readme",
+  "bugs": {
+    "url": "https://github.com/juanfranem/opencode-auto-guard/issues"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com",
+    "access": "public"
+  },
   "scripts": {
-    "test": "bun src/tests/evasion-test.ts && bun src/tests/compact-test.ts",
+    "test": "bun src/tests/evasion-test.ts && bun src/tests/compact-test.ts && bun src/tests/jev-test.ts",
     "test:evasion": "bun src/tests/evasion-test.ts",
     "test:compact": "bun src/tests/compact-test.ts",
+    "test:jev": "bun src/tests/jev-test.ts",
     "typecheck": "tsc --noEmit",
     "lint": "biome lint .",
     "lint:fix": "biome lint --write .",
@@ -32,5 +56,13 @@
     "@types/bun": "latest",
     "typescript": "^5.5.0"
   },
-  "files": ["src/index.ts", "src/rules.ts", "agents", "README.md", "LICENSE", "docs"]
+  "files": [
+    "src/index.ts",
+    "src/rules.ts",
+    "src/judge-fast.ts",
+    "agents",
+    "README.md",
+    "LICENSE",
+    "docs"
+  ]
 }

@@ -130,6 +130,28 @@ interface ResolvedOptions {
    * Not in the protected-paths list — treated as known temp area.
    */
   tempDir: string;
+  /**
+   * Optional fast structured judge (e.g. `opencode/jev-1.13-free`).
+   * When set, the plugin calls this endpoint BEFORE the LLM judge for
+   * shell commands that land in the ambiguous bucket. Free and fast
+   * (~70–500 ms). Falls back to the LLM judge on error, low
+   * confidence, or when no API key is configured.
+   */
+  fastJudgeModel?: string;
+  /** Endpoint for the structured judge. Default: OpenCode Zen systemone. */
+  fastJudgeEndpoint: string;
+  /**
+   * Bearer token for the structured judge. Falls back to the
+   * `OPENCODE_ZEN_API_KEY` env var. When neither is set, the fast
+   * judge is silently skipped.
+   */
+  fastJudgeApiKey?: string;
+  /** Per-request timeout in ms. Default 5000 — Jev is fast. */
+  fastJudgeTimeoutMs: number;
+  /** Minimum Jev confidence (0–1) to accept a deny verdict. */
+  fastJudgeConfidenceDeny: number;
+  /** Minimum Jev confidence (0–1) to accept an ask verdict. */
+  fastJudgeConfidenceAsk: number;
 }
 
 interface AuditEntry {
@@ -175,6 +197,14 @@ function readNumber(v: unknown, fallback: number): number {
   return typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : fallback;
 }
 
+/** Clamp a number to [lo, hi]. Falls back if not finite / negative. */
+function readClamped(v: unknown, fallback: number, lo: number, hi: number): number {
+  const n = typeof v === "number" && Number.isFinite(v) ? v : fallback;
+  if (n < lo) return lo;
+  if (n > hi) return hi;
+  return n;
+}
+
 function readStringArray(v: unknown): string[] | undefined {
   if (!Array.isArray(v)) return undefined;
   if (!v.every((x) => typeof x === "string")) return undefined;
@@ -183,6 +213,15 @@ function readStringArray(v: unknown): string[] | undefined {
 
 function resolveOptions(ctx: any): ResolvedOptions {
   const o = ctx.options ?? {};
+  const explicitKey =
+    typeof o.fastJudgeApiKey === "string" && o.fastJudgeApiKey.length > 0
+      ? o.fastJudgeApiKey
+      : undefined;
+  const envKey =
+    typeof process.env.OPENCODE_ZEN_API_KEY === "string" &&
+    process.env.OPENCODE_ZEN_API_KEY.length > 0
+      ? process.env.OPENCODE_ZEN_API_KEY
+      : undefined;
   return {
     judge: readBool(o.judge, true),
     judgeModel: typeof o.model === "string" ? o.model : undefined,
@@ -203,6 +242,18 @@ function resolveOptions(ctx: any): ResolvedOptions {
       typeof o.tempDir === "string" && o.tempDir.length > 0
         ? path.resolve(o.tempDir)
         : defaultTempDir(),
+    fastJudgeModel:
+      typeof o.fastJudgeModel === "string" && o.fastJudgeModel.length > 0
+        ? o.fastJudgeModel
+        : undefined,
+    fastJudgeEndpoint:
+      typeof o.fastJudgeEndpoint === "string" && o.fastJudgeEndpoint.length > 0
+        ? o.fastJudgeEndpoint
+        : "https://opencode.ai/zen/v1/systemone",
+    fastJudgeApiKey: explicitKey ?? envKey,
+    fastJudgeTimeoutMs: readNumber(o.fastJudgeTimeoutMs, 5000),
+    fastJudgeConfidenceDeny: readClamped(o.fastJudgeConfidenceDeny, 0.75, 0, 1),
+    fastJudgeConfidenceAsk: readClamped(o.fastJudgeConfidenceAsk, 0.6, 0, 1),
   };
 }
 
@@ -353,6 +404,10 @@ async function resolveAndCheck(
 
 // ============== LLM judge ==============
 
+// Fast structured judge (Jev-style) lives in its own module so it can be
+// exercised in isolation by tests without booting the plugin runtime.
+import { judgeWithFastModel } from "./judge-fast";
+
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   return new Promise((resolve, reject) => {
     const t = setTimeout(() => reject(new Error("judge-timeout")), ms);
@@ -451,6 +506,32 @@ export default Plugin.define({
       );
     } catch {
       // best-effort
+    }
+
+    // 1.6) Record fast-judge configuration once at startup. Useful for
+    //      diagnosing "I set the option but nothing happens" — the audit
+    //      log makes it visible whether the key was found.
+    if (opts.fastJudgeModel) {
+      const keySource = process.env.OPENCODE_ZEN_API_KEY
+        ? "env"
+        : ctx.options?.fastJudgeApiKey
+          ? "option"
+          : "missing";
+      await writeAudit(
+        ctx,
+        mkAudit(
+          {
+            sessionID: "<setup>",
+            agent: undefined,
+            action: "setup",
+            effect: "allow",
+            resources: [opts.fastJudgeModel],
+          },
+          "allow",
+          "fast_judge_setup",
+          `model=${opts.fastJudgeModel} endpoint=${opts.fastJudgeEndpoint} key=${keySource}`,
+        ),
+      );
     }
 
     // ====== Hook principal: permission.evaluate ======
@@ -655,9 +736,87 @@ export default Plugin.define({
             if (originalEffect === "allow") continue;
           }
 
+          // Fast structured judge (e.g. Jev). Runs before the LLM judge
+          // so most ambiguous cases resolve in <500 ms at zero cost.
+          // The LLM judge below is gated on `!judged` so we never
+          // double-judge the same command.
+          if (
+            opts.fastJudgeModel &&
+            opts.fastJudgeApiKey &&
+            worst === "ask" &&
+            !reason.includes("lectura segura") &&
+            !reason.includes("(fast)") &&
+            !judged
+          ) {
+            const fastStart = Date.now();
+            const fast = await judgeWithFastModel(
+              opts.fastJudgeEndpoint,
+              opts.fastJudgeModel,
+              opts.fastJudgeApiKey,
+              opts.fastJudgeTimeoutMs,
+              agent,
+              event.resources as string[],
+            );
+            const fastMs = Date.now() - fastStart;
+            if (fast) {
+              await writeAudit(
+                ctx,
+                mkAudit(
+                  event,
+                  fast.decision,
+                  "shell_fast_judge",
+                  `model=${opts.fastJudgeModel} conf=${fast.confidence.toFixed(2)} ms=${fastMs}`,
+                  false,
+                  redactedResources,
+                ),
+              );
+              if (fast.decision === "deny" && fast.confidence >= opts.fastJudgeConfidenceDeny) {
+                worst = "deny";
+                reason = `${PLUGIN_NAME}(jev): ${fast.reason}`;
+                judged = true;
+              } else if (
+                fast.decision === "ask" &&
+                fast.confidence >= opts.fastJudgeConfidenceAsk
+              ) {
+                reason = `${PLUGIN_NAME}(jev): ${fast.reason}`;
+                judged = true;
+              } else {
+                // Decision present but confidence below threshold — fall
+                // through to LLM judge. Audit so users can tune thresholds.
+                await writeAudit(
+                  ctx,
+                  mkAudit(
+                    event,
+                    event.effect,
+                    "shell_fast_judge_low_conf",
+                    `decision=${fast.decision} conf=${fast.confidence.toFixed(2)} deny_th=${opts.fastJudgeConfidenceDeny} ask_th=${opts.fastJudgeConfidenceAsk}`,
+                    false,
+                    redactedResources,
+                  ),
+                );
+              }
+            } else {
+              // No verdict (error, malformed response, missing key).
+              // Silent unless the key was present — a network blip
+              // shouldn't spam the audit log.
+              await writeAudit(
+                ctx,
+                mkAudit(
+                  event,
+                  event.effect,
+                  "shell_fast_judge_error",
+                  `model=${opts.fastJudgeModel} ms=${fastMs}`,
+                  false,
+                  redactedResources,
+                ),
+              );
+            }
+          }
+
           // Strong LLM judge for ambiguous cases.
           if (
             opts.judge &&
+            !judged &&
             worst === "ask" &&
             !reason.includes("lectura segura") &&
             !reason.includes("(fast)")

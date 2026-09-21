@@ -1,0 +1,181 @@
+# Release workflow.
+#
+# Trigger: push of a tag matching vMAJOR.MINOR.PATCH (e.g. v0.1.0),
+# or manual run from the Actions tab.
+#
+# What it does:
+#   1. Runs the full quality gate (typecheck + lint + format:check + tests
+#      on ubuntu + windows). If anything fails the release is aborted.
+#   2. Builds the package as an npm tarball with `bun pm pack`.
+#   3. Creates a GitHub Release and attaches the tarball + a SHA-256
+#      sidecar so consumers can verify integrity. This is the path
+#      users hit with `opencode plugin add github:juanfranem/opencode-auto-guard#vX.Y.Z`.
+#   4. Publishes the same tarball to GitHub Packages
+#      (npm.pkg.github.com) under the @juanfranem/ scope. This is
+#      the path users hit with `opencode plugin add @juanfranem/opencode-auto-guard`.
+#
+# Auth: relies on the workflow's GITHUB_TOKEN. No NPM_TOKEN secret
+# required because GitHub Packages authenticates with the GitHub token
+# itself when the token has `packages: write` permission.
+#
+# First-time setup (one-time, manual, on GitHub):
+#   After the first successful publish, GitHub creates the package
+#   privately under your account. Make it public via:
+#     https://github.com/juanfranem/opencode-auto-guard/packages
+#   Subsequent publishes to the same version are no-ops; bump the
+#   version in package.json and push a new tag.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (must already exist as a git tag)"
+        required: true
+        type: string
+
+# Cancel any in-flight release run for the same ref. Old runs usually
+# mean a force-push or a duplicate tag, and finishing both wastes CI.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write     # create the release
+  packages: write     # publish to GitHub Packages
+  id-token: write     # trusted provenance
+  attestations: write # sigstore provenance attestation
+
+jobs:
+  # ====== 1. Quality gates ===========================================
+  # Run the same checks the regular CI runs (ci.yml) so we don't
+  # ship a tarball that fails lint or tests. Matrix across OS so
+  # a Windows-only regression can't sneak in.
+  quality:
+    name: quality (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Cache bun install
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.bun/install/cache
+            node_modules
+          key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+          restore-keys: |
+            bun-${{ runner.os }}-
+
+      - name: Install
+        run: bun install --frozen-lockfile
+
+      - name: Quality gate
+        run: |
+          bun run typecheck
+          bun run lint
+          bun run format:check
+          bun run test
+
+  # ====== 2. Pack + publish ==========================================
+  # Single-OS job: we just need one good tarball, and the quality job
+  # already proved the code builds.
+  publish:
+    name: pack + publish
+    needs: quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Cache bun install
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.bun/install/cache
+            node_modules
+          key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+
+      - name: Install
+        run: bun install --frozen-lockfile
+
+      # Strip the leading 'v' from the tag so npm sees a clean semver.
+      # `git describe` matches the pushing CI ref; workflow_dispatch falls
+      # back to the user-provided tag.
+      - name: Resolve version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      # Pack into a known location so the next steps can refer to it
+      # by path regardless of the registry's package-naming rules.
+      - name: Pack tarball
+        working-directory: ${{ github.workspace }}
+        run: |
+          mkdir -p dist
+          bun pm pack --destination dist --gzip-level 9
+          ls -la dist
+
+      - name: Compute SHA-256
+        id: hash
+        working-directory: ${{ github.workspace }}/dist
+        run: |
+          # Compute the hash and stage the sidecar file.
+          HASH=$(sha256sum *.tgz | awk '{print $1}')
+          echo "sha256=$HASH" >> "$GITHUB_OUTPUT"
+          cp *.tgz *.tgz.sha256 <<< "$HASH *.tgz"
+
+      # ====== 2a. GitHub Release with tarball attached ================
+      # Attach the tarball so `opencode plugin add github:juanfranem/opencode-auto-guard#vX.Y.Z`
+      # resolves it. Also drop the SHA-256 so users can verify.
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.tgz
+            dist/*.sha256
+
+      # ====== 2b. GitHub Packages =====================================
+      # Same tarball, published to npm.pkg.github.com with the
+      # @juanfranem/ scope so `opencode plugin add @juanfranem/opencode-auto-guard`
+      # works. Auth via the workflow's GITHUB_TOKEN; no secret needed.
+      - name: Publish to GitHub Packages
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        working-directory: ${{ github.workspace }}/dist
+        run: |
+          npm config set //npm.pkg.github.com/:_authToken "$GITHUB_TOKEN"
+          npm config set registry https://npm.pkg.github.com/juanfranem
+          npm publish --registry=https://npm.pkg.github.com --access public *.tgz

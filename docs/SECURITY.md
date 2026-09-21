@@ -46,10 +46,18 @@ defends against malicious tool calls that exploit over-permissive config.
 |    c. Fast classifier (no LLM)            |
 |    d. Network egress extraction           |
 |       (curl, wget, ssh, nc, ...)          |
-|    e. LLM judge for ambiguous cases       |
-|       - rate-limited per session          |
-|    f. Per-agent escalation (build)        |
-|    g. Per-agent tightening (no auto-allow)|
+|    e. Fast structured judge (Jev)         |
+|       - runs only when no LLM judge slot  |
+|         would otherwise burn on the case  |
+|       - 5 s timeout, free on OpenCode Zen |
+|       - falls through to LLM judge on     |
+|         error, unsure, or low confidence  |
+|       - never elevates ask → allow        |
+|    f. LLM judge for ambiguous cases       |
+|       - rate-limited per session (20)     |
+|       - skipped if fast judge decided     |
+|    g. Per-agent escalation (build)        |
+|    h. Per-agent tightening (no auto-allow)|
 +-------------------------------------------+
                   |
                   v
@@ -108,6 +116,14 @@ defends against malicious tool calls that exploit over-permissive config.
 - **Cost attacks via LLM judge**: the LLM judge is rate-limited to 20 calls
   per session. Beyond that, ambiguous cases fall back to `ask` directly
   without consuming the judge budget.
+- **Free fast judge as a second opinion**: when `fastJudgeModel` is set, a
+  structured-decision model (e.g. Jev on OpenCode Zen) runs **before** the
+  LLM judge for ambiguous shell commands. High-confidence verdicts short-
+  circuit and skip the LLM judge entirely, conserving the rate-limited LLM
+  budget. Low confidence or `unsure` outcomes fall through to the existing
+  LLM judge — never replace it. The fast judge itself can only **deny** or
+  keep **ask**; it never elevates `ask → allow`. See `README.md` for the
+  exact stacking and the trust caveats from the published Jev test report.
 - **Audit log unbounded growth**: the hash-chained audit auto-rotates at
   10,000 entries. Older entries are archived under
   `guard:audit-archive-${date}-${n}` keys with a pointer record so the
@@ -175,6 +191,10 @@ external store.
 
 ## Reporting vulnerabilities
 
-Email: security@your-domain.example (replace before publishing).
+Open a private advisory on GitHub (preferred, avoids exposing a personal
+email in the repo):
 
-Please do not file public issues for security bugs.
+  https://github.com/juanfranem/opencode-auto-guard/security/advisories/new
+
+Alternatively, email the address listed on the GitHub profile. Please do
+not file public issues for security bugs.

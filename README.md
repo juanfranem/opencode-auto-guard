@@ -29,22 +29,42 @@ by default: when in doubt, deny.
 
 ## Install
 
-### From npm (once published)
+### From GitHub Releases (recommended, no auth needed for public install)
+
+Pick a tag from <https://github.com/juanfranem/opencode-auto-guard/releases>
+and use the GitHub tarball URL:
 
 ```bash
-opencode plugin add opencode-auto-guard
+opencode plugin add github:juanfranem/opencode-auto-guard#v0.1.0
 ```
 
-### From git (during development)
+The release workflow attaches the package tarball to each GitHub
+Release, so any tag you `git push` is automatically installable.
+
+### From GitHub Packages
 
 ```bash
-opencode plugin add github:your-user/opencode-auto-guard
+opencode plugin add @juanfranem/opencode-auto-guard
 ```
 
-### From a local path
+Requires that your OpenCode install can reach `npm.pkg.github.com`.
+For a public package on GitHub Packages, configure an `.npmrc` with the
+registry before installing:
+
+```ini
+# ~/.npmrc or %USERPROFILE%\.npmrc
+@juanfranem:registry=https://npm.pkg.github.com
+//npm.pkg.github.com/:_authToken=<your-github-token-with-read:packages>
+```
+
+If you don't have a token, prefer the GitHub Releases install above.
+
+### From a local clone (during development)
 
 ```bash
-opencode plugin add "C:\path\to\opencode-auto-guard"
+git clone https://github.com/juanfranem/opencode-auto-guard.git
+cd opencode-auto-guard
+opencode plugin add file://.
 ```
 
 Then add the plugin to your `opencode.jsonc`:
@@ -54,18 +74,22 @@ Then add the plugin to your `opencode.jsonc`:
   "$schema": "https://opencode.ai/config.json",
   "plugins": [
     {
-      "package": "opencode-auto-guard",
+      "package": "@juanfranem/opencode-auto-guard",
       "options": {
         "judge": true,
         "model": "anthropic/claude-sonnet-4-5",
         "strictBuild": true,
-        "trustedDomains": ["github.com", "mi-empresa.local"],
+        "trustedDomains": ["github.com", "example.com"],
         "pin": "sha256:..."
       }
     }
   ]
 }
 ```
+
+> **Note:** even when installed from a GitHub Release tarball, the
+> plugin's npm name remains `@juanfranem/opencode-auto-guard`. Use that
+> string in `opencode.jsonc` regardless of how you installed it.
 
 ## Options
 
@@ -85,7 +109,96 @@ All options are optional. Defaults are conservative.
 | `compactSessionsDir` | string | `~/.config/opencode/opencode-auto-guard/sessions` | Where the `compact-context-guard` skill writes its raw dumps and refined handoff documents. |
 | `compactOnContextGuard` | boolean | `true` | When the context guard fires, dump the conversation and auto-invoke the `compact-context-guard` skill in the paused session. Set `false` to disable. |
 | `tempDir` | string | `~/.config/opencode/opencode-auto-guard/tmp` | Scratch directory the auto agent uses for intermediate output (compiled artefacts, test fixtures, logs). Created on plugin startup; not in the protected-paths list. |
+| `fastJudgeModel` | string | unset | Optional fast structured judge (e.g. `opencode/jev-1.13-free`). Runs BEFORE the LLM judge for ambiguous shell commands; free and ~70–500 ms typical. Falls back to the LLM judge on error, low confidence, or when no API key is configured. Requires `OPENCODE_ZEN_API_KEY` env var or `fastJudgeApiKey`. |
+| `fastJudgeEndpoint` | string | `https://opencode.ai/zen/v1/systemone` | Endpoint for the structured judge. Override only if you self-host a "system one"-compatible model. |
+| `fastJudgeApiKey` | string | unset | Bearer token for the structured judge. Falls back to `OPENCODE_ZEN_API_KEY` env var. |
+| `fastJudgeTimeoutMs` | number | `5000` | Per-request timeout for the fast judge. Jev is fast; 5 s is a generous ceiling. |
+| `fastJudgeConfidenceDeny` | number | `0.75` | Minimum confidence (0–1) for the fast judge to issue a `deny`. Below this, falls through to the LLM judge. |
+| `fastJudgeConfidenceAsk` | number | `0.6` | Minimum confidence for the fast judge to short-circuit an `ask`. Below this, the LLM judge still gets the case. |
 | `pin` | string | unset | SHA-256 of `index.ts` + `rules.ts`. If set and mismatch → plugin disables. |
+
+## Fast structured judge (Jev)
+
+For shell commands that fall through to the ambiguous bucket, the
+plugin can call a "system one" model (e.g. [Jev on OpenCode Zen](https://opencode.ai/docs/zen/))
+**before** the LLM judge. The fast judge is free during the OpenCode
+promo period, responds in ~70–500 ms, and returns typed decisions
+instead of text. The LLM judge stays on as the safety net for cases
+where Jev returns low confidence or `unsure`.
+
+### Enable it
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [
+    {
+      "package": "opencode-auto-guard",
+      "options": {
+        "judge": true,
+        "fastJudgeModel": "opencode/jev-1.13-free",
+        "judgeModel": "anthropic/claude-sonnet-4-5"
+        // fastJudgeApiKey optional: falls back to OPENCODE_ZEN_API_KEY env var
+      }
+    }
+  ]
+}
+```
+
+### Auth
+
+```powershell
+$env:OPENCODE_ZEN_API_KEY = "your-zen-key"
+# or set fastJudgeApiKey in opencode.jsonc
+```
+
+Without a key the fast judge is silently skipped and only the LLM judge
+runs.
+
+### How it stacks
+
+```
+shell command
+   |
+   v
+HARD_DENY patterns?            -> deny
+HARD_ASK / ALWAYS_ASK patterns?-> ask
+fast classifier (no LLM)       -> deny / ask / (continue)
+trusted-domain network check?  -> ask
+auto allowlist (auto agent)?   -> allow
+                                |
+                  ambiguous (worst=ask)
+                                |
+                                v
+                  fast structured judge (Jev)   <-- NEW
+                  - 5s timeout
+                  - free
+                  - aborts to LLM on error / unsure / low conf
+                                |
+                  high-conf deny  -> deny  (LLM judge skipped)
+                  high-conf ask   -> ask   (LLM judge skipped)
+                  else                     -> LLM judge (existing)
+```
+
+### Caveats from the published test report
+
+- **One injection test, not a guarantee.** Jev passed a basic
+  prompt-injection attempt in the published tests, but a single test
+  does not prove resistance to more sophisticated injection
+  techniques. We still treat Jev's output as data, not authority.
+- **Forced-choice without `unsure` is dangerous.** The published
+  report shows that without an "other" / "unsure" option the model
+  picks a confident-wrong answer. We always include `unsure` in the
+  question schema; on `unsure` we fall through to the LLM judge.
+- **Confidence ≠ accuracy.** Treat Jev's confidence score as a
+  threshold for *when to ask for a second opinion*, not as a measure of
+  how correct the verdict is. The plugin audits every decision with the
+  raw confidence so you can tune `fastJudgeConfidenceDeny` /
+  `fastJudgeConfidenceAsk` against your own workload.
+- **Negation is the failure mode to watch.** The report showed Jev
+  parses "I'm not asking for a refund" correctly, but a single example
+  doesn't generalise. If you see Jev missing negations in your own
+  audit log, raise `fastJudgeConfidenceDeny`.
 
 ## Get the current pin
 
