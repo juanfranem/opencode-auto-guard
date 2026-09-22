@@ -4,6 +4,12 @@ All notable changes to **opencode-auto-guard** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.1.2] — 2026-09-22
+
+### Fixed
+
+- **`/auto-guard-setup` failed at runtime** with `SchemaError(Expected string at ["text"])` after the v0.1.1 fix made `execute` actually push a prompt. The `SessionPromptInput` schema's `text` field is an indexed-access type that resolves to a plain `string`, but the wizard was passing `{ text: wizardPrompt }` (an object). Patched to pass `text: wizardPrompt` directly. `description` is kept as the picker-preview text so the wizard remains visible in the slash menu. End-to-end verified on OpenCode v2.0.12.
+
 ## [0.1.1] — 2026-09-21
 
 ### Fixed
