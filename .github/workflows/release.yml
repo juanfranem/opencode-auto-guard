@@ -147,10 +147,13 @@ jobs:
         id: hash
         working-directory: ${{ github.workspace }}/dist
         run: |
-          # Compute the hash and stage the sidecar file.
+          # Compute the hash and stage the sidecar file. The format is the
+          # one `sha256sum -c` expects: "<hash>  " (two spaces,
+          # binary mode stripped). `softprops/action-gh-release@v2` will
+          # pick it up via the `dist/*.sha256` glob below.
           HASH=$(sha256sum *.tgz | awk '{print $1}')
           echo "sha256=$HASH" >> "$GITHUB_OUTPUT"
-          cp *.tgz *.tgz.sha256 <<< "$HASH *.tgz"
+          echo "$HASH  *.tgz" > *.tgz.sha256
 
       # ====== 2a. GitHub Release with tarball attached ================
       # Attach the tarball so `opencode plugin add github:juanfranem/opencode-auto-guard#vX.Y.Z`
