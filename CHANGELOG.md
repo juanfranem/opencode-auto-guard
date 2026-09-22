@@ -4,6 +4,24 @@ All notable changes to **opencode-auto-guard** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.1.3] — 2026-09-22
+
+### Added
+
+- **Auto-registration on first install.** `src/agent-registration.ts` runs from `setup()` and now (a) seeds `~/.config/opencode/agents/auto.md` from the bundled `agents/auto.md` the very first time the plugin starts in a fresh home directory, and (b) applies the canonical permission list through `ctx.agent.transform`. The previous manual `Copy-Item` + `opencode.jsonc` edit step is gone for users who accept the defaults. The flow runs **before** the self-integrity pin check so a missing `options.pin` still delivers the agent. Explicit `agents.auto` declarations in `opencode.jsonc` win — the plugin only fills in fields you left empty.
+- **`AUTO_AGENT_ID` and `AUTO_AGENT_DEFAULT_PERMISSIONS`** constants exported from `src/rules.ts`. Single source of truth for the agent id and its default rule list; tests assert both.
+- **`agent-registration` audit category.** `auto_agent_register` entries land in the hash-chained audit log on every `setup()` so you can verify what the plugin did (whether the file was written, whether the editor applied the defaults).
+- **`test:agent-registration`** test script — exercises path helpers, the bundled-source resolution, idempotent seeding, the agent editor's permissive/rejective paths, the user-override guarantee, and end-to-end through `registerAutoAgent`.
+
+### Changed
+
+- `package.json` `files` manifest now ships `src/agent-registration.ts` alongside the other runtime modules.
+- README "Auto mode" section rewritten: documents that the agent is auto-registered on first install, with the manual `opencode.jsonc` block now positioned as an **override** recipe rather than the install procedure. Pin hash path updated to the `@juanfranem/opencode-auto-guard` scope that matches the GitHub Packages name.
+
+### Fixed
+
+- README incorrectly claimed that "OpenCode v2 does not let plugins register agents through `ctx.agent.transform`" — this was true at the time of writing `0.1.0` but `@opencode/plugin@2.0.x` has exposed both `ctx.agent.transform` and `ctx.skill.transform` ever since, and the plugin already uses `ctx.skill.transform` for `compact-context-guard`. The "Auto mode" section is now aligned with the actual SDK surface.
+
 ## [0.1.2] — 2026-09-22
 
 ### Fixed

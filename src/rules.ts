@@ -715,6 +715,38 @@ export function worstDecision(a: Decision, b: Decision): Decision {
 export const COMPACT_CONTEXT_GUARD_SKILL_ID = "compact-context-guard";
 
 /**
+ * Stable identifier for the bundled Auto agent. The plugin seeds
+ * `agents/auto.md` into the user's agents directory and applies default
+ * permissions through `ctx.agent.transform` using this id. Keep in sync
+ * with `agents/auto.md` (the file's `description` front-matter is the
+ * authoritative name; the id is what OpenCode keys by in the picker).
+ */
+export const AUTO_AGENT_ID = "auto";
+
+/**
+ * Default permissions the auto agent ships with. Mirrors the block
+ * documented in README.md. Pulled out as a constant so tests can
+ * assert shape and `agent-registration.ts` can apply it through
+ * `ctx.agent.transform`. Users may override by declaring their own
+ * `agents.auto` block in `opencode.jsonc`; the plugin only fills in
+ * permissions when the user has left the list empty.
+ */
+export const AUTO_AGENT_DEFAULT_PERMISSIONS: ReadonlyArray<{
+  readonly action: string;
+  readonly resource: string;
+  readonly effect: "allow" | "deny" | "ask";
+}> = Object.freeze([
+  { action: "external_directory", resource: "*", effect: "ask" },
+  { action: "read", resource: "*", effect: "allow" },
+  { action: "edit", resource: "*", effect: "allow" },
+  { action: "glob", resource: "*", effect: "allow" },
+  { action: "grep", resource: "*", effect: "allow" },
+  { action: "shell", resource: "*", effect: "ask" },
+  { action: "webfetch", resource: "*github.com*", effect: "allow" },
+  { action: "webfetch", resource: "*", effect: "ask" },
+]);
+
+/**
  * Default location the plugin dumps per-session conversation archives
  * and the agent writes refined compact documents to. Resolves to
  *   ~/.config/opencode/opencode-auto-guard/sessions/
