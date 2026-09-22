@@ -51,6 +51,7 @@ import {
   buildSetupWizardPrompt,
   buildCompactContextSkillPrompt,
   COMPACT_CONTEXT_GUARD_SKILL_ID,
+  AUTO_AGENT_ID,
   defaultCompactSessionsDir,
   defaultTempDir,
   rawDumpPath,
@@ -58,6 +59,7 @@ import {
   type Decision,
   type SessionState,
 } from "./rules";
+import { registerAutoAgent } from "./agent-registration";
 
 // ============== Plugin metadata ==============
 
@@ -478,6 +480,32 @@ export default Plugin.define({
   id: "auto-guard",
   async setup(ctx) {
     const opts = resolveOptions(ctx);
+
+    // 0) Auto-register the bundled Auto agent and permissions. Runs
+    //    BEFORE the self-integrity check so users who haven't configured
+    //    a pin yet (the common case at first install) still get the
+    //    agent on their very first session. Best-effort: a failure
+    //    here is logged to the audit and does not block the plugin.
+    try {
+      const outcome = await registerAutoAgent(ctx as never, import.meta.url);
+      await writeAudit(
+        ctx,
+        mkAudit(
+          {
+            sessionID: "<setup>",
+            agent: undefined,
+            action: "setup",
+            effect: "allow",
+            resources: [AUTO_AGENT_ID],
+          },
+          "allow",
+          "auto_agent_register",
+          `seed=${outcome.seed.wrote ? `wrote:${outcome.seed.destPath}` : `kept:${outcome.seed.destPath}`} apply=${outcome.apply.applied}${outcome.apply.reason ? ` (${outcome.apply.reason})` : ""}`,
+        ),
+      );
+    } catch {
+      // best-effort
+    }
 
     // 1) Self-integrity: refuse to register if the pin doesn't match.
     const integrity = await verifySelfIntegrity(ctx, opts.pin);

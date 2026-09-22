@@ -201,8 +201,8 @@ Auth via `$env:OPENCODE_ZEN_API_KEY` or `fastJudgeApiKey`. Without a key, the fa
 After installing, compute and pin the hash so the plugin refuses to register if its files are tampered with:
 
 ```powershell
-$index = Get-FileHash "$env:USERPROFILE\.config\opencode\node_modules\opencode-auto-guard\src\index.ts" -Algorithm SHA256
-$rules = Get-FileHash "$env:USERPROFILE\.config\opencode\node_modules\opencode-auto-guard\src\rules.ts" -Algorithm SHA256
+$index = Get-FileHash "$env:USERPROFILE\.config\opencode\node_modules\@juanfranem\opencode-auto-guard\src\index.ts" -Algorithm SHA256
+$rules = Get-FileHash "$env:USERPROFILE\.config\opencode\node_modules\@juanfranem\opencode-auto-guard\src\rules.ts" -Algorithm SHA256
 $combined = [System.BitConverter]::ToString((
   [System.Security.Cryptography.SHA256]::Create().ComputeHash(
     [System.Text.Encoding]::UTF8.GetBytes($index.Hash + "|" + $rules.Hash)
@@ -296,14 +296,9 @@ Disable auto-invoke with `compactOnContextGuard: false`, or move the output with
 
 The package ships an agent definition (`agents/auto.md`) for routine development — known-safe patterns are auto-approved, the LLM judge can only deny. **Auto** is for trusted, routine work. Switch to **build** for untrusted input and **plan** when you want to approve everything.
 
-OpenCode v2 does not let plugins register agents through `ctx.agent.transform`, so copy the file once:
+> **v0.1.3+ — no manual steps.** The plugin's `setup()` registers the agent for you on first install. `src/agent-registration.ts` reads the bundled `agents/auto.md` and copies it into `~/.config/opencode/agents/auto.md` (only if the file isn't already there — your local edits are preserved), then calls `ctx.agent.transform(...)` to set `mode = "primary"` and fill in the default permission list (`AUTO_AGENT_DEFAULT_PERMISSIONS`). An entry is written to the audit log under category `auto_agent_register` so you can verify what happened.
 
-```powershell
-Copy-Item "$env:USERPROFILE\.config\opencode\node_modules\opencode-auto-guard\agents\auto.md" `
-  -Destination "$env:USERPROFILE\.config\opencode\agents\auto.md"
-```
-
-Then register it in `opencode.jsonc`:
+If you'd rather override the defaults (different model, hide it from the picker, custom permissions), declare `agents.auto` in your `opencode.jsonc` — your values win, the plugin only fills in fields you left empty:
 
 ```jsonc
 {
@@ -311,7 +306,6 @@ Then register it in `opencode.jsonc`:
     "auto": {
       "mode": "primary",
       "model": "anthropic/claude-sonnet-4-5",
-      "prompt": "{file:./agents/auto.md}",
       "permissions": [
         { "action": "external_directory", "resource": "*", "effect": "ask" },
         { "action": "read", "resource": "*", "effect": "allow" },
