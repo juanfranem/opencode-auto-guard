@@ -169,7 +169,27 @@ jobs:
             dist/*.tgz
             dist/*.sha256
 
-      # ====== 2b. GitHub Packages =====================================
+      # ====== 2b. Floating 'latest' tag ================================
+      # Mirror what `npm install @scope/pkg` (with no version) does on
+      # the npm side: keep a `latest` Git ref pointing at the most
+      # recent stable release so `opencode plugin add
+      # github:juanfranem/opencode-auto-guard#latest` always resolves
+      # to whatever shipped most recently. Only moves on tag-push
+      # events; workflow_dispatch is excluded so rerunning an older
+      # release for any reason won't accidentally demote `latest`.
+      - name: Update floating 'latest' tag
+        if: github.event_name == 'push'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f latest "$GITHUB_SHA"
+          # Refs are immutable per-fetch, so a rewritten tag needs an
+          # explicit delete+push. Tolerate the case where the tag
+          # didn't exist remotely yet (first publish of the workflow).
+          git push origin ":refs/tags/latest" 2>/dev/null || true
+          git push origin "refs/tags/latest:refs/tags/latest"
+
+      # ====== 2c. GitHub Packages =====================================
       # Same tarball, published to npm.pkg.github.com with the
       # @juanfranem/ scope so `opencode plugin add @juanfranem/opencode-auto-guard`
       # works. Auth via the workflow's GITHUB_TOKEN; no secret needed.

@@ -57,13 +57,23 @@ opencode plugin add github:juanfranem/opencode-auto-guard#v0.1.0
 
 Pick any tag from the [Releases page](https://github.com/juanfranem/opencode-auto-guard/releases); the release workflow attaches the package tarball to every release, so any tag is installable without a token. The npm name stays `@juanfranem/opencode-auto-guard` regardless of how you install it.
 
+#### Tracking the most recent release (`#latest`)
+
+The release workflow keeps a moving `latest` tag in sync with the most recent stable release, mirroring what `npm install @scope/pkg` does on the npm side via the implicit `latest` dist-tag:
+
+```bash
+opencode plugin add github:juanfranem/opencode-auto-guard#latest
+```
+
+Use `#<exact-tag>` (e.g. `#v0.1.3`) for reproducible installs and `#latest` for always-on upgrades. The `latest` tag only advances on a tag-push event — manually re-running the release workflow against an older version never moves it backwards.
+
 ### Alternative — GitHub Packages (npm-compatible)
 
 ```bash
 opencode plugin add @juanfranem/opencode-auto-guard
 ```
 
-Requires that your OpenCode install can reach `npm.pkg.github.com` and a token with `read:packages` in your `.npmrc`:
+`@<scope>/<pkg>` with no version pins to the highest semver on the registry, which is the npm `latest` dist-tag. Requires that your OpenCode install can reach `npm.pkg.github.com` and a token with `read:packages` in your `.npmrc`:
 
 ```ini
 # ~/.npmrc (or %USERPROFILE%\.npmrc on Windows)
