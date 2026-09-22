@@ -62,7 +62,7 @@ import {
 // ============== Plugin metadata ==============
 
 export const PLUGIN_NAME = "opencode-auto-guard";
-export const PLUGIN_VERSION = "0.1.1";
+export const PLUGIN_VERSION = "0.1.2";
 
 // ============== Defaults ==============
 
@@ -1026,6 +1026,11 @@ export default Plugin.define({
     // real prompt from `execute`. The wizard text is generated from a pure
     // function so the questions, defaults, and post-collection steps can
     // be unit-tested.
+    //
+    // `ctx.session.prompt({ sessionID, text })` requires `text` to be a
+    // plain string (the SessionPromptInput schema's `text` field is an
+    // indexed-access type that resolves to `string`, not the inner
+    // `{ text: ... }` object this code used to pass).
     const wizardPrompt = buildSetupWizardPrompt({
       configPath: `${os.homedir()}/.config/opencode/opencode.jsonc`,
       currentOptions: opts as unknown as Record<string, unknown>,
@@ -1038,7 +1043,7 @@ export default Plugin.define({
           try {
             await ctx.session.prompt({
               sessionID: input.sessionID,
-              text: { text: wizardPrompt },
+              text: wizardPrompt,
             } as never);
           } catch {
             // Best-effort: if the session is busy or the prompt endpoint
