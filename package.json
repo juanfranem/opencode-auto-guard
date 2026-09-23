@@ -1,6 +1,6 @@
 {
   "name": "@juanfranem/opencode-auto-guard",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Multi-layer guard plugin for OpenCode v2 — stops dangerous shell commands, web requests, and file edits before the agent runs them.",
   "license": "MIT",
   "type": "module",
@@ -33,11 +33,12 @@
     "access": "public"
   },
   "scripts": {
-    "test": "bun src/tests/evasion-test.ts && bun src/tests/compact-test.ts && bun src/tests/agent-registration-test.ts && bun src/tests/jev-test.ts",
+    "test": "bun src/tests/evasion-test.ts && bun src/tests/compact-test.ts && bun src/tests/agent-registration-test.ts && bun src/tests/jev-test.ts && bun src/tests/env-placeholder-test.ts",
     "test:evasion": "bun src/tests/evasion-test.ts",
     "test:compact": "bun src/tests/compact-test.ts",
     "test:agent-registration": "bun src/tests/agent-registration-test.ts",
     "test:jev": "bun src/tests/jev-test.ts",
+    "test:env-placeholder": "bun src/tests/env-placeholder-test.ts",
     "typecheck": "tsc --noEmit",
     "lint": "biome lint .",
     "lint:fix": "biome lint --write .",

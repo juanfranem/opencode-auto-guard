@@ -565,6 +565,48 @@ export function fullHash(s: string): string {
   return `sha256:${crypto.createHash("sha256").update(s).digest("hex")}`;
 }
 
+// ============== Config interpolation ==============
+
+/**
+ * Expand `{env:VAR}` placeholders to `process.env.VAR`, mirroring the
+ * interpolation OpenCode applies when it hands plugin options to a
+ * runtime. Used so a user can write:
+ *
+ * ```jsonc
+ * "fastJudgeApiKey": "{env:OPENCODE_ZEN_TOKEN}"
+ * ```
+ *
+ * and have the plugin resolve the token at startup instead of forwarding
+ * the literal string to be used as a Bearer credential.
+ *
+ * Behavior:
+ *   - `{env:VAR}` where VAR is set       -> returns the env value
+ *   - `{env:VAR}` where VAR is not set   -> returns `undefined` so the
+ *                                          caller can fall through to its
+ *                                          next resolution source
+ *   - non-placeholder string             -> returned as-is (the empty
+ *                                          string maps to undefined so a
+ *                                          downstream truthy-check still
+ *                                          works)
+ *   - non-string input (undefined, null,
+ *     number, object…)                   -> returns undefined
+ *
+ * Identifier rules match what the shell accepts in `process.env`:
+ * `[_$A-Za-z][_$A-Za-z0-9]*`. Anything outside that (e.g. `{env:}`,
+ * `{env:1foo}`, `{env:VAR` without the closing brace) is left as the raw
+ * string — silently dropping user data has bitten us before.
+ */
+export function expandEnvPlaceholder(value: string | undefined): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const m = value.match(/^\{env:([A-Za-z_$][A-Za-z0-9_$]*)\}$/);
+  if (m) {
+    const envValue = process.env[m[1]];
+    if (typeof envValue !== "string" || envValue.length === 0) return undefined;
+    return envValue;
+  }
+  return value.length > 0 ? value : undefined;
+}
+
 // ============== Path protection (cross-platform) ==============
 
 function normPath(p: string): string {
