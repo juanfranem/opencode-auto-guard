@@ -113,6 +113,8 @@ const AUDIT_KEEP_RECENT = 5_000;
 interface ResolvedOptions {
   judge: boolean;
   judgeModel?: string;
+  /** Per-request timeout in ms for the LLM judge. Default 15000. */
+  judgeTimeoutMs: number;
   strictBuild: boolean;
   trustedDomains: string[];
   protectedPaths: string[];
@@ -250,6 +252,7 @@ function resolveOptions(ctx: any): ResolvedOptions {
   return {
     judge: readBool(o.judge, true),
     judgeModel,
+    judgeTimeoutMs: readNumber(o.judgeTimeoutMs, DEFAULT_JUDGE_TIMEOUT_MS),
     strictBuild: readBool(o.strictBuild, true),
     trustedDomains: readStringArray(o.trustedDomains) ?? defaultTrustedDomains(),
     protectedPaths: readStringArray(o.protectedPaths) ?? defaultProtectedPaths(),
@@ -423,9 +426,24 @@ async function resolveAndCheck(
 // exercised in isolation by tests without booting the plugin runtime.
 import { judgeWithFastModel } from "./judge-fast";
 
+/**
+ * Marker error thrown by `withTimeout` when the wrapped promise hasn't
+ * settled within the budget. Using a dedicated class (not a plain
+ * `Error` with a string message) lets the call site discriminate a
+ * timeout from a real SDK error in the audit log without a string
+ * match, and lets the audit surface the actual underlying error name
+ * when it isn't a timeout.
+ */
+class JudgeTimeoutError extends Error {
+  constructor() {
+    super("judge-timeout");
+    this.name = "JudgeTimeoutError";
+  }
+}
+
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   return new Promise((resolve, reject) => {
-    const t = setTimeout(() => reject(new Error("judge-timeout")), ms);
+    const t = setTimeout(() => reject(new JudgeTimeoutError()), ms);
     p.then(
       (v) => {
         clearTimeout(t);
@@ -465,11 +483,18 @@ type LLMJudgeOutcome =
       kind: "skip";
       reason: LLMJudgeSkipReason;
       ms: number;
+      // Optional diagnostic payload for the audit row. Populated
+      // when the call site wants to surface the underlying error name
+      // and message (e.g. so an `AbortError` from a fetch timeout
+      // doesn't get bucketed as opaque `gen_error`).
+      errName?: string;
+      errMessage?: string;
     };
 
 async function judgeWithLLM(
   ctx: any,
   judgeModelOpt: string | undefined,
+  judgeTimeoutMs: number,
   agent: string | undefined,
   resources: string[],
 ): Promise<LLMJudgeOutcome> {
@@ -479,11 +504,27 @@ async function judgeWithLLM(
   // of just "reason=gen_timeout". `ms` is the single most useful
   // signal for distinguishing a stuck-inference from a slow-but-fine
   // response when a regression hits.
-  const skip = (reason: LLMJudgeSkipReason): LLMJudgeOutcome => ({
+  const skip = (
+    reason: LLMJudgeSkipReason,
+    errName?: string,
+    errMessage?: string,
+  ): LLMJudgeOutcome => ({
     kind: "skip",
     reason,
     ms: Date.now() - t0,
+    errName,
+    errMessage: errMessage?.slice(0, 200),
   });
+
+  // Best-effort extraction of `err.name` / `err.message` regardless
+  // of whether the thrown value was an Error, DOMException, or
+  // something exotic. Keeps the audit row informative without
+  // throwing on the un-throwable.
+  const errInfo = (e: unknown): { name: string; message: string } => {
+    if (e instanceof Error) return { name: e.name, message: e.message };
+    if (typeof e === "string") return { name: "StringThrow", message: e };
+    return { name: typeof e, message: String(e) };
+  };
 
   let def: { data?: { providerID: string; modelID: string } } | undefined;
   let model: { providerID: string; id: string } | undefined;
@@ -497,11 +538,13 @@ async function judgeWithLLM(
         : d
           ? { providerID: d.providerID, id: d.modelID }
           : undefined;
-  } catch {
+  } catch (e) {
     // Resolving the default model threw (e.g. the SDK was in a weird
     // state). Surface as `gen_error` so we don't conflate it with
-    // "no model is configured".
-    return skip("gen_error");
+    // "no model is configured". The errName/errMessage lets the
+    // next "why does default() throw" be a single kv-table grep.
+    const { name, message } = errInfo(e);
+    return skip("gen_error", name, message);
   }
   if (!model) return skip("no_default_model");
 
@@ -519,19 +562,19 @@ async function judgeWithLLM(
 
   let out: unknown;
   try {
-    out = await withTimeout(
-      ctx.generate.text({ model, prompt } as never),
-      DEFAULT_JUDGE_TIMEOUT_MS,
-    );
+    out = await withTimeout(ctx.generate.text({ model, prompt } as never), judgeTimeoutMs);
   } catch (e) {
-    // `withTimeout` rejects with a DOMException on timeout. Anything
-    // else thrown here is a `generate.text` SDK error. The two are
-    // useful to distinguish in the audit (a slow model vs a broken
-    // SDK call both look the same as "no verdict" without this split).
-    if (e instanceof DOMException && e.name === "AbortError") {
-      return skip("gen_timeout");
+    // `withTimeout` rejects with a `JudgeTimeoutError` (see class
+    // above). Anything else thrown here is an SDK / network error.
+    // Surfacing `err.name` + `err.message` in the audit makes the
+    // next "this hangs at 15 s again" diagnosable without re-running
+    // a probe — and keeps timeouts out of the opaque `gen_error`
+    // bucket.
+    if (e instanceof JudgeTimeoutError) {
+      return skip("gen_timeout", "JudgeTimeoutError", e.message);
     }
-    return skip("gen_error");
+    const { name, message } = errInfo(e);
+    return skip("gen_error", name, message);
   }
   const text = String((out as { text?: string })?.text ?? "");
   const m = text.match(/\{[\s\S]*\}/);
@@ -1034,6 +1077,7 @@ export default Plugin.define({
               const outcome = await judgeWithLLM(
                 ctx,
                 opts.judgeModel,
+                opts.judgeTimeoutMs,
                 agent,
                 event.resources as string[],
               );
@@ -1053,13 +1097,25 @@ export default Plugin.define({
                   ),
                 );
               } else {
+                // Runtime failure (timeout / parse / bad shape). Each
+                // reason is distinct so the next "why is the LLM
+                // judge returning null" is a single grep instead of
+                // a guessing game. We also surface errName/errMessage
+                // when the caller has them — without this, a
+                // 15-second apparent hang at 15 000 ms would just
+                // say `reason=gen_error ms=15007` (v0.1.8 bug: we
+                // mistook our own `withTimeout` for an SDK error).
+                const errFragment =
+                  outcome.errName !== undefined
+                    ? ` err=${outcome.errName}:${(outcome.errMessage ?? "").slice(0, 120)}`
+                    : "";
                 await writeAudit(
                   ctx,
                   mkAudit(
                     event,
                     event.effect,
                     "llm_judge_skip",
-                    `reason=${outcome.reason} ms=${outcome.ms}`,
+                    `reason=${outcome.reason} ms=${outcome.ms}${errFragment}`,
                   ),
                 );
               }
