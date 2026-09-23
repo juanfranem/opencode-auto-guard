@@ -264,13 +264,21 @@ async function runOnce(answers: unknown): Promise<FastJudgeResult | null> {
   ok("ask verdict mapped", r?.kind === "verdict" && r.decision === "ask" && r.confidence === 0.8);
 }
 {
+  // `unsure` is Jev's documented escape hatch — the model legitimately
+  // couldn't commit. Returns its own kind so the caller can route through
+  // the LLM judge tier instead of treating it as a parse error.
   const r = await runOnce({ verdict: { type: "choice", choice: "unsure", confidence: 0.4 } });
+  ok("unsure → its own kind (not parse_error)", r?.kind === "unsure" && r.confidence === 0.4);
   ok(
-    "unsure → parse_error with reason=unknown_choice=unsure",
-    r?.kind === "parse_error" && r.reason === "unknown_choice=unsure",
+    "unsure carries status and body for diagnostics",
+    r?.kind === "unsure" &&
+      r.status === 200 &&
+      typeof r.body === "string" &&
+      r.body.includes("unsure"),
   );
 }
 {
+  // Truly unknown choice values (a future criterion name) stay parse_error.
   const r = await runOnce({ verdict: { type: "choice", choice: "MAYBE", confidence: 0.7 } });
   ok(
     "unknown verdict value → parse_error with reason=unknown_choice=maybe",

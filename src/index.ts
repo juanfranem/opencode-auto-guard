@@ -798,12 +798,19 @@ export default Plugin.define({
           // so most ambiguous cases resolve in <500 ms at zero cost.
           // The LLM judge below is gated on `!judged` so we never
           // double-judge the same command.
+          //
+          // NOTE: deliberately does NOT check `!reason.includes("(fast)")`.
+          // The regex pre-classifier writes "(fast): ..." for its `ask`
+          // decision (line 781), but that's the most uncertain outcome —
+          // exactly the case where we'd want the structured judge and the
+          // LLM judge to escalate. The old check gated them both out; we
+          // rely on `worst === "ask"` alone to decide whether to ask
+          // either judge.
           if (
             opts.fastJudgeModel &&
             opts.fastJudgeApiKey &&
             worst === "ask" &&
             !reason.includes("lectura segura") &&
-            !reason.includes("(fast)") &&
             !judged
           ) {
             const fastStart = Date.now();
@@ -858,9 +865,21 @@ export default Plugin.define({
               // kind gets its own audit category so the next
               // intermittent failure can be classified from the kv
               // table alone, without re-running a probe.
+              //
+              // `unsure` deliberately does NOT set `judged = true` —
+              // it's the LLM judge's cue that it should run on this
+              // command. We log it as `shell_fast_judge_unsure` so a
+              // user can tell "Jev saw ambiguity" apart from
+              // "Jev returned a malformed shape".
               let category: string;
               let extra: string;
               switch (fast.kind) {
+                case "unsure":
+                  category = "shell_fast_judge_unsure";
+                  extra =
+                    `model=${opts.fastJudgeModel} ms=${fastMs} ` +
+                    `conf=${fast.confidence.toFixed(2)} status=${fast.status} body=${fast.body}`;
+                  break;
                 case "http_error":
                   category = "shell_fast_judge_http_error";
                   extra =
@@ -890,24 +909,38 @@ export default Plugin.define({
           }
 
           // Strong LLM judge for ambiguous cases.
-          if (
-            opts.judge &&
-            !judged &&
-            worst === "ask" &&
-            !reason.includes("lectura segura") &&
-            !reason.includes("(fast)")
-          ) {
+          //
+          // We drop the `!reason.includes("(fast)")` check that used to sit here:
+          // that marker is written by the regex pre-classifier for its own `ask`
+          // decision, and blocking the LLM judge on it meant the entire `ask`
+          // path (the most common case — and the case Jev specifically defers
+          // to the LLM judge on via `unsure`) never escalated. The gate is now
+          // `worst === "ask"` alone, which is what we actually want.
+          //
+          // `llmJudgeReachedActualCall` records whether this hook run invoked
+          // the LLM judge (or skipped it for a known reason). Anything other than
+          // a real call writes an `llm_judge_skip reason=...` audit so the next
+          // silent-skip on `worst=ask` doesn't go unnoticed.
+          let llmJudgeReachedActualCall = false;
+          if (opts.judge && !judged && worst === "ask" && !reason.includes("lectura segura")) {
             const judgeCount = (judgeCallsBySession.get(sessionID) ?? 0) + 1;
             if (judgeCount > JUDGE_CALL_LIMIT_PER_SESSION) {
-              // Throttled: keep current worst (ask), audit the skip.
+              // Throttled: keep current worst (ask), audit the skip
+              // through the unified llm_judge_skip channel (legacy
+              // `judge_throttled` retained for grep-compat).
               await writeAudit(
                 ctx,
                 mkAudit(event, event.effect, "judge_throttled", `calls=${judgeCount - 1}`, judged),
+              );
+              await writeAudit(
+                ctx,
+                mkAudit(event, event.effect, "llm_judge_skip", "reason=throttled"),
               );
             } else {
               judgeCallsBySession.set(sessionID, judgeCount);
               const needsJudge = (event.resources as string[]).some((r) => !isSafe(unwrap(r)));
               if (needsJudge) {
+                llmJudgeReachedActualCall = true;
                 const verdict = await judgeWithLLM(
                   ctx,
                   opts.judgeModel,
@@ -920,8 +953,45 @@ export default Plugin.define({
                     worst = "deny";
                     reason = `${PLUGIN_NAME}(juez): ${verdict.reason}`;
                   }
+                } else {
+                  // judgeWithLLM returned null — model unavailable,
+                  // timed out, or no parseable verdict. Surface as a
+                  // skip so the audit doesn't go silent.
+                  await writeAudit(
+                    ctx,
+                    mkAudit(event, event.effect, "llm_judge_skip", "reason=no_verdict"),
+                  );
                 }
+              } else {
+                // All resources were classified safe by the regex pre-pass;
+                // nothing ambiguous for the LLM to weigh on. Audit so
+                // we can spot a future over-eager safe classification.
+                await writeAudit(
+                  ctx,
+                  mkAudit(event, event.effect, "llm_judge_skip", "reason=all_resources_safe"),
+                );
               }
+            }
+          }
+
+          // Gate didn't fire — audit why so the next mystery `judged:0`
+          // on `worst=ask` doesn't repeat. Skip this audit when `judge`
+          // is disabled, since that's the user's chosen behaviour and
+          // we'd just spam the kv table for every ambient shell event.
+          if (!llmJudgeReachedActualCall && worst === "ask" && !reason.includes("lectura segura")) {
+            let skipReason = "judge_disabled";
+            if (opts.judge) {
+              if (judged) skipReason = "already_judged";
+              else if (worst !== "ask") skipReason = "not_ask";
+              else skipReason = "gate_not_match";
+            }
+            // Only log the surprising reasons — `judge_disabled` is the
+            // explicit user choice and would flood the kv table.
+            if (skipReason !== "judge_disabled") {
+              await writeAudit(
+                ctx,
+                mkAudit(event, event.effect, "llm_judge_skip", `reason=${skipReason}`),
+              );
             }
           }
 
