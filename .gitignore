@@ -13,3 +13,9 @@ coverage/
 
 # dev-only helpers used to stage split commits during plugin work
 scripts/
+
+# PR body sidecars used as drafts during release work (PR_BODY_V018.md,
+# PR_BODY_V019_BUMP.md, …). They live next to the repo so we can grep
+# past drafts, but they should never get committed — the canonical
+# copy of every PR body is in the GitHub PR conversation itself.
+PR_BODY_*.md
