@@ -44,6 +44,19 @@
 //   - Probability field on `choice` answers isn't pinned by the public
 //     docs at the moment, so we read several known names and fall back
 //     to 0 rather than guess.
+//
+// Error telemetry:
+//   The function returns a discriminated `FastJudgeResult` instead of
+//   `null`. Production code at index.ts maps each `kind` to a distinct
+//   audit-log category:
+//     - `verdict`        — happy path, downstream decision logic.
+//     - `http_error`     — upstream returned 4xx/5xx. status+body captured.
+//     - `parse_error`    — 2xx but the body didn't have the shape we
+//                          expected. reason+body+status captured.
+//     - `network_error`  — fetch threw (DNS, ECONNRESET, AbortController…).
+//                          errorKind+message captured.
+//   Splitting these made the difference between guessing and being able
+//   to identify the next intermittent failure from the audit log alone.
 
 export interface FastJudgeAnswerMap {
   is_dangerous?: { type?: string; noul?: number };
@@ -64,12 +77,36 @@ export interface FastJudgeResponse {
   [k: string]: unknown;
 }
 
-export interface FastJudgeVerdict {
-  decision: "deny" | "ask";
-  confidence: number;
-  reason: string;
-  raw: FastJudgeResponse;
-}
+/**
+ * Discriminated result of a `judgeWithFastModel` call. The `verdict`
+ * variant is the only one that carries a decision; the others are
+ * diagnostic payloads for the audit log so intermittent upstream
+ * failures can be categorized without leaving the session.
+ */
+export type FastJudgeResult =
+  | {
+      kind: "verdict";
+      decision: "deny" | "ask";
+      confidence: number;
+      reason: string;
+      raw: FastJudgeResponse;
+    }
+  | {
+      kind: "http_error";
+      status: number;
+      body: string;
+    }
+  | {
+      kind: "parse_error";
+      status: number;
+      reason: string;
+      body: string;
+    }
+  | {
+      kind: "network_error";
+      errorKind: string;
+      message: string;
+    };
 
 /**
  * Strip the `opencode/` provider prefix that OpenCode's own model
@@ -93,7 +130,7 @@ export function stripOpencodePrefix(modelId: string): string {
  * winner to [0,1]. Out-of-range values (>1 or <0) are clamped — we
  * don't silently renormalize, so a future API change that returns a
  * 1..10 score will surface as "always max confident" rather than
- * re-interpret the user's data behind their back.
+ * re-interpreting user data behind their back.
  */
 function pickConfidence(answer: FastJudgeAnswerMap["verdict"]): number {
   if (!answer || typeof answer !== "object") return 0;
@@ -107,17 +144,69 @@ function pickConfidence(answer: FastJudgeAnswerMap["verdict"]): number {
 }
 
 /**
+ * Slice a string for safe inclusion in the audit log. Bodies can be
+ * megabytes and we don't want a single bad answer to bloat the log.
+ * The trailing ellipsis signals that the audit reader should expect a
+ * truncation, not a malformed write.
+ */
+function auditTruncate(s: string, max = 150): string {
+  if (s.length <= max) return s;
+  return `${s.slice(0, max)}…`;
+}
+
+/**
+ * Pull the most diagnostic-friendly bits out of a `fetch` rejection.
+ * We surface `Error.name` (e.g. "AbortError", "TypeError") plus any
+ * `error.cause.code` (which carries Node's `ECONNRESET` / `ENOTFOUND` /
+ * `ECONNREFUSED` etc.), so a user reading the audit can tell a timeout
+ * from a DNS failure from a TLS handshake failure without re-running.
+ */
+function describeNetworkError(err: unknown): { errorKind: string; message: string } {
+  if (err && typeof err === "object") {
+    const e = err as {
+      name?: unknown;
+      message?: unknown;
+      cause?: { code?: unknown; message?: unknown };
+    };
+    const code = typeof e.cause?.code === "string" ? e.cause.code : undefined;
+    const errorKind =
+      [typeof e.name === "string" ? e.name : "Unknown", code].filter(Boolean).join("/") ||
+      "Unknown";
+    const raw = typeof e.message === "string" ? e.message : String(err);
+    const firstLine = raw.split("\n", 1)[0] ?? raw;
+    return { errorKind, message: auditTruncate(firstLine, 120) };
+  }
+  return { errorKind: "Unknown", message: auditTruncate(String(err), 120) };
+}
+
+/**
+ * Drain a `Response.text()` defensively. Some failure paths may
+ * throw trying to read the body (e.g. a network-level reset mid-stream)
+ * — we capture that as well so a body-read failure isn't lost.
+ */
+async function safeReadBody(resp: Response): Promise<string> {
+  try {
+    return await resp.text();
+  } catch {
+    return "";
+  }
+}
+
+/**
  * Call a "system one"-shaped structured-decision endpoint (e.g. Jev on
- * OpenCode Zen). Returns a deny/ask verdict with calibrated confidence,
- * or null on any failure — the caller is expected to fall back to the
- * LLM judge.
+ * OpenCode Zen). Returns a discriminated `FastJudgeResult`; the
+ * `verdict` variant carries the decision, the others are diagnostic
+ * payloads (status + body for HTTP / parse failures, error kind for
+ * network failures) so the caller can write a precise audit row.
  *
  * Inputs:
  *   endpoint      — full URL of the systemone endpoint
  *   modelId       — model id, e.g. "opencode/jev-1.13-free" — the
  *                   `opencode/` provider prefix is stripped at the wire
  *   apiKey        — bearer token; if undefined the call short-circuits
- *                   to null so the LLM judge takes over
+ *                   to null (no api key means the caller never invoked
+ *                   us in the first place; we keep `null` for that
+ *                   path so the surrounding gate stays simple).
  *   timeoutMs     — per-request timeout; default 5000 is plenty for Jev
  *   agent         — name of the active agent (for context only)
  *   resources     — array of shell commands to classify
@@ -129,7 +218,7 @@ export async function judgeWithFastModel(
   timeoutMs: number,
   agent: string | undefined,
   resources: string[],
-): Promise<FastJudgeVerdict | null> {
+): Promise<FastJudgeResult | null> {
   if (!apiKey) return null;
 
   const ctrl = new AbortController();
@@ -160,8 +249,9 @@ export async function judgeWithFastModel(
     },
   };
 
+  let resp: Response;
   try {
-    const resp = await fetch(endpoint, {
+    resp = await fetch(endpoint, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -170,27 +260,74 @@ export async function judgeWithFastModel(
       body: JSON.stringify(body),
       signal: ctrl.signal,
     });
-    if (!resp.ok) return null;
-    const data = (await resp.json()) as FastJudgeResponse;
-    if (!data || typeof data.answers !== "object" || data.answers === null) return null;
-
-    const verdict = data.answers.verdict;
-    if (!verdict || verdict.type !== "choice") return null;
-
-    const choiceRaw = typeof verdict.choice === "string" ? verdict.choice.toLowerCase() : "";
-    if (choiceRaw !== "deny" && choiceRaw !== "ask") return null; // includes "unsure"
-
-    const confidence = pickConfidence(verdict);
-
-    return {
-      decision: choiceRaw,
-      confidence,
-      reason: `${choiceRaw}@${(confidence * 100).toFixed(0)}%`,
-      raw: data,
-    };
-  } catch {
-    return null;
+  } catch (err) {
+    return { kind: "network_error", ...describeNetworkError(err) };
   } finally {
     clearTimeout(timer);
   }
+
+  if (!resp.ok) {
+    const bodyText = await safeReadBody(resp);
+    return { kind: "http_error", status: resp.status, body: auditTruncate(bodyText) };
+  }
+
+  let data: FastJudgeResponse | null;
+  let rawText: string;
+  try {
+    rawText = await resp.text();
+    data = JSON.parse(rawText) as FastJudgeResponse;
+  } catch {
+    return {
+      kind: "parse_error",
+      status: resp.status,
+      reason: "json_parse",
+      body: auditTruncate(rawText),
+    };
+  }
+  if (!data || typeof data.answers !== "object" || data.answers === null) {
+    return {
+      kind: "parse_error",
+      status: resp.status,
+      reason: "missing_answers",
+      body: auditTruncate(JSON.stringify(data)),
+    };
+  }
+
+  const verdict = data.answers.verdict;
+  if (!verdict || typeof verdict !== "object") {
+    return {
+      kind: "parse_error",
+      status: resp.status,
+      reason: "missing_verdict",
+      body: auditTruncate(JSON.stringify(data.answers)),
+    };
+  }
+  if (verdict.type !== "choice") {
+    return {
+      kind: "parse_error",
+      status: resp.status,
+      reason: `wrong_verdict_type=${typeof verdict.type === "string" ? verdict.type : "non_string"}`,
+      body: auditTruncate(JSON.stringify(data.answers)),
+    };
+  }
+
+  const choiceRaw = typeof verdict.choice === "string" ? verdict.choice.toLowerCase() : "";
+  if (choiceRaw !== "deny" && choiceRaw !== "ask") {
+    return {
+      kind: "parse_error",
+      status: resp.status,
+      reason: `unknown_choice=${choiceRaw || "non_string"}`,
+      body: auditTruncate(JSON.stringify(data.answers)),
+    };
+  }
+
+  const confidence = pickConfidence(verdict);
+
+  return {
+    kind: "verdict",
+    decision: choiceRaw,
+    confidence,
+    reason: `${choiceRaw}@${(confidence * 100).toFixed(0)}%`,
+    raw: data,
+  };
 }

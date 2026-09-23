@@ -6,21 +6,17 @@
 //   2. The body strips OpenCode's `opencode/` provider prefix so the
 //      wire carries the bare model id Jev expects.
 //   3. Auth header is set from the resolved key.
-//   4. Schema-mapped responses: deny/ask/unsure → expected verdict shape.
-//   5. Confidence thresholds: low confidence falls back (null), high
-//      confidence yields a verdict.
-//   6. Errors: network failure, non-2xx, malformed JSON, missing
-//      `answers`, missing verdict, missing key all return null.
-//   7. Timeout via AbortController triggers when the upstream hangs.
+//   4. Schema-mapped responses: deny/ask → expected verdict shape.
+//   5. Diagnostic telemetry: HTTP/parse/network failures each come
+//      back as a distinct discriminated `kind` with status, body or
+//      error kind captured, instead of the previous opaque null.
+//   6. Timeout via AbortController becomes a `network_error` whose
+//      errorKind says AbortError (so users can tell a timeout from
+//      a DNS failure from a TLS handshake failure in the audit log).
 //
 // Run with: bun src/tests/jev-test.ts
-//
-// This file does NOT exercise the full permission hook end-to-end
-// (that's covered by evasion-test.ts); it focuses on the function in
-// isolation so we can iterate on the schema mapping without spinning
-// up the whole plugin.
 
-import { judgeWithFastModel, stripOpencodePrefix, type FastJudgeVerdict } from "../judge-fast";
+import { judgeWithFastModel, stripOpencodePrefix, type FastJudgeResult } from "../judge-fast";
 
 let pass = 0;
 let fail = 0;
@@ -48,6 +44,7 @@ type FetchCall = {
 let nextResponse = "";
 let nextStatus = 200;
 let nextDelayMs = 0;
+let nextBodyReadShouldThrow = false;
 let calls: FetchCall[] = [];
 
 function mockFetch(): typeof fetch {
@@ -80,10 +77,20 @@ function mockFetch(): typeof fetch {
       });
     }
 
-    return new Response(nextResponse || "{}", {
+    const resp = new Response(nextResponse || "{}", {
       status: nextStatus,
       headers: { "Content-Type": "application/json" },
     });
+    // For the parse-error-body-read test only — strip the body mid-stream
+    // by stubbing the body getter.
+    if (nextBodyReadShouldThrow) {
+      Object.defineProperty(resp, "text", {
+        value: async () => {
+          throw new DOMException("network hangup", "AbortError");
+        },
+      });
+    }
+    return resp;
   }) as unknown as typeof fetch;
 }
 
@@ -128,7 +135,7 @@ section("Request shape — endpoint, schema, auth header");
   });
   globalThis.fetch = mockFetch();
 
-  const v = await judgeWithFastModel(
+  const r = await judgeWithFastModel(
     "https://opencode.ai/zen/v1/systemone",
     "opencode/jev-1.13-free", // user-config style, with `opencode/` prefix
     "test-key-abc",
@@ -137,7 +144,8 @@ section("Request shape — endpoint, schema, auth header");
     ["git status", "npm install foo"],
   );
 
-  ok("returns a verdict", v !== null);
+  ok("returns a verdict", r?.kind === "verdict");
+  const v = r?.kind === "verdict" ? r : null;
   ok("verdict is ask", v?.decision === "ask");
   ok("verdict confidence preserved", v?.confidence === 0.9);
   ok("single call made", calls.length === 1);
@@ -189,7 +197,7 @@ section("Request shape — endpoint, schema, auth header");
     answers: { verdict: { type: "choice", choice: "ask", confidence: 0.7 } },
   });
   globalThis.fetch = mockFetch();
-  const v = await judgeWithFastModel(
+  const r = await judgeWithFastModel(
     "https://opencode.ai/zen/v1/systemone",
     "jev-1.13-free", // already stripped
     "k",
@@ -199,7 +207,7 @@ section("Request shape — endpoint, schema, auth header");
   );
   ok(
     "body.model is bare when input has no opencode/ prefix",
-    calls[0]?.body?.model === "jev-1.13-free" && v?.decision === "ask",
+    calls[0]?.body?.model === "jev-1.13-free" && r?.kind === "verdict",
   );
 }
 
@@ -210,7 +218,7 @@ section("Request shape — endpoint, schema, auth header");
     answers: { verdict: { type: "choice", choice: "ask", confidence: 0.7 } },
   });
   globalThis.fetch = mockFetch();
-  const v = await judgeWithFastModel(
+  const r = await judgeWithFastModel(
     "https://opencode.ai/zen/v1/systemone",
     "zai-coding-plan/glm-5.3-flash",
     "k",
@@ -220,17 +228,17 @@ section("Request shape — endpoint, schema, auth header");
   );
   ok(
     "body.model preserves unknown provider prefixes",
-    calls[0]?.body?.model === "zai-coding-plan/glm-5.3-flash" && v?.decision === "ask",
+    calls[0]?.body?.model === "zai-coding-plan/glm-5.3-flash" && r?.kind === "verdict",
   );
 }
 
 // =====================================================================
-// 2. Verdict mapping
+// 2. Verdict mapping (happy path)
 // =====================================================================
 
 section("Verdict mapping — deny / ask / unsure");
 
-async function runOnce(answers: unknown): Promise<FastJudgeVerdict | null> {
+async function runOnce(answers: unknown): Promise<FastJudgeResult | null> {
   calls = [];
   nextResponse = JSON.stringify({ answers });
   globalThis.fetch = mockFetch();
@@ -245,57 +253,67 @@ async function runOnce(answers: unknown): Promise<FastJudgeVerdict | null> {
 }
 
 {
-  const v = await runOnce({ verdict: { type: "choice", choice: "deny", confidence: 0.95 } });
-  ok("deny verdict mapped", v?.decision === "deny" && (v?.confidence ?? 0) === 0.95);
+  const r = await runOnce({ verdict: { type: "choice", choice: "deny", confidence: 0.95 } });
+  ok(
+    "deny verdict mapped",
+    r?.kind === "verdict" && r.decision === "deny" && r.confidence === 0.95,
+  );
 }
 {
-  const v = await runOnce({ verdict: { type: "choice", choice: "ask", confidence: 0.8 } });
-  ok("ask verdict mapped", v?.decision === "ask" && (v?.confidence ?? 0) === 0.8);
+  const r = await runOnce({ verdict: { type: "choice", choice: "ask", confidence: 0.8 } });
+  ok("ask verdict mapped", r?.kind === "verdict" && r.decision === "ask" && r.confidence === 0.8);
 }
 {
-  const v = await runOnce({ verdict: { type: "choice", choice: "unsure", confidence: 0.4 } });
-  ok("unsure → null (lets LLM judge take over)", v === null);
+  const r = await runOnce({ verdict: { type: "choice", choice: "unsure", confidence: 0.4 } });
+  ok(
+    "unsure → parse_error with reason=unknown_choice=unsure",
+    r?.kind === "parse_error" && r.reason === "unknown_choice=unsure",
+  );
 }
 {
-  const v = await runOnce({ verdict: { type: "choice", choice: "MAYBE", confidence: 0.7 } });
-  ok("unknown verdict value → null", v === null);
+  const r = await runOnce({ verdict: { type: "choice", choice: "MAYBE", confidence: 0.7 } });
+  ok(
+    "unknown verdict value → parse_error with reason=unknown_choice=maybe",
+    r?.kind === "parse_error" && r.reason === "unknown_choice=maybe",
+  );
 }
 
 // =====================================================================
-// 3. Confidence clamping + field-name fallbacks
+// 3. Confidence clamping + field fallbacks
 // =====================================================================
 
 section("Confidence clamping + lenient probability-name fallback");
 
 {
-  const v = await runOnce({ verdict: { type: "choice", choice: "deny", confidence: 1.5 } });
-  ok("confidence >1 → clamped to 1", v?.confidence === 1);
+  const r = await runOnce({ verdict: { type: "choice", choice: "deny", confidence: 1.5 } });
+  ok("confidence >1 → clamped to 1", r?.kind === "verdict" && r.confidence === 1);
 }
 {
-  const v = await runOnce({ verdict: { type: "choice", choice: "deny", confidence: -0.2 } });
-  ok("confidence <0 → clamped to 0", v?.confidence === 0);
+  const r = await runOnce({ verdict: { type: "choice", choice: "deny", confidence: -0.2 } });
+  ok("confidence <0 → clamped to 0", r?.kind === "verdict" && r.confidence === 0);
 }
 {
-  const v = await runOnce({ verdict: { type: "choice", choice: "deny" } });
+  const r = await runOnce({ verdict: { type: "choice", choice: "deny" } });
   ok(
     "missing confidence → 0 (still a verdict, but caller thresholds will reject)",
-    v?.confidence === 0,
+    r?.kind === "verdict" && r.confidence === 0,
   );
 }
 {
   // Some Jev-style responses use `probability` instead of `confidence`.
-  const v = await runOnce({ verdict: { type: "choice", choice: "deny", probability: 0.62 } });
-  ok("`probability` field is honoured", v?.confidence === 0.62);
+  const r = await runOnce({ verdict: { type: "choice", choice: "deny", probability: 0.62 } });
+  ok("`probability` field is honoured", r?.kind === "verdict" && r.confidence === 0.62);
 }
 {
-  // …or just `prob`.
-  const v = await runOnce({ verdict: { type: "choice", choice: "deny", prob: 0.31 } });
-  ok("`prob` field is honoured", v?.confidence === 0.31);
+  const r = await runOnce({ verdict: { type: "choice", choice: "deny", prob: 0.31 } });
+  ok("`prob` field is honoured", r?.kind === "verdict" && r.confidence === 0.31);
 }
 {
-  // Out-of-band >1 is clamped to 1 — we never silently renormalize.
-  const v = await runOnce({ verdict: { type: "choice", choice: "deny", probability: 7 } });
-  ok("`probability` >1 clamps to 1 (no silent renormalization)", v?.confidence === 1);
+  const r = await runOnce({ verdict: { type: "choice", choice: "deny", probability: 7 } });
+  ok(
+    "`probability` >1 clamps to 1 (no silent renormalization)",
+    r?.kind === "verdict" && r.confidence === 1,
+  );
 }
 
 // =====================================================================
@@ -305,22 +323,25 @@ section("Confidence clamping + lenient probability-name fallback");
 section("is_dangerous answer (noul) is ignored — only verdict gates the decision");
 
 {
-  const v = await runOnce({
+  const r = await runOnce({
     is_dangerous: { type: "noul", noul: 0.96 },
     verdict: { type: "choice", choice: "ask", confidence: 0.55 },
   });
   ok(
     "verdict still resolves to ask even when is_dangerous.noul is high",
-    v?.decision === "ask" && v?.confidence === 0.55,
+    r?.kind === "verdict" && r.decision === "ask" && r.confidence === 0.55,
   );
 }
 {
-  const v = await runOnce({ is_dangerous: { type: "noul", noul: 0.0 } });
-  ok("missing verdict → null (is_dangerous alone can't decide)", v === null);
+  const r = await runOnce({ is_dangerous: { type: "noul", noul: 0.0 } });
+  ok(
+    "missing verdict → parse_error (is_dangerous alone can't decide)",
+    r?.kind === "parse_error" && r.reason === "missing_verdict",
+  );
 }
 
 // =====================================================================
-// 5. Missing key
+// 5. Missing key — the one path that still returns null
 // =====================================================================
 
 section("No key → skip (returns null)");
@@ -328,7 +349,7 @@ section("No key → skip (returns null)");
 {
   globalThis.fetch = mockFetch();
   calls = [];
-  const v = await judgeWithFastModel(
+  const r = await judgeWithFastModel(
     "https://opencode.ai/zen/v1/systemone",
     "opencode/jev-1.13-free",
     undefined,
@@ -336,17 +357,17 @@ section("No key → skip (returns null)");
     "auto",
     ["git status"],
   );
-  ok("returns null when no api key", v === null);
+  ok("returns null when no api key", r === null);
   ok("did not call fetch without a key", calls.length === 0);
 }
 
 // =====================================================================
-// 6. Error paths
+// 6. Error paths — discriminated kinds, with diagnostic payloads
 // =====================================================================
 
-section("Error paths — non-2xx, malformed JSON, missing fields");
+section("Error paths — http_error captures status + body, parse_error captures reason + body");
 
-async function runWithStatus(status: number, body: string): Promise<FastJudgeVerdict | null> {
+async function runWithStatus(status: number, body: string): Promise<FastJudgeResult | null> {
   calls = [];
   nextStatus = status;
   nextResponse = body;
@@ -363,68 +384,161 @@ async function runWithStatus(status: number, body: string): Promise<FastJudgeVer
 
 {
   nextStatus = 500;
-  const v = await runWithStatus(500, "{}");
-  ok("HTTP 500 → null", v === null);
+  const r = await runWithStatus(500, '{"error":"upstream blew up"}');
+  ok("HTTP 500 → http_error", r?.kind === "http_error" && r.status === 500);
+  ok(
+    "HTTP 500 body is captured and truncated",
+    r?.kind === "http_error" && r.body.includes("upstream blew up"),
+  );
 }
 {
   nextStatus = 401;
-  const v = await runWithStatus(401, "{}");
-  ok("HTTP 401 → null", v === null);
+  const r = await runWithStatus(401, "unauthorized");
+  ok("HTTP 401 → http_error", r?.kind === "http_error" && r.status === 401);
 }
 {
-  const v = await runWithStatus(200, "not json");
-  ok("malformed JSON → null", v === null);
+  const r = await runWithStatus(200, "not json");
+  ok(
+    "malformed JSON → parse_error with reason=json_parse",
+    r?.kind === "parse_error" && r.reason === "json_parse",
+  );
+  ok(
+    "malformed JSON body is captured (so users can eyeball upstream gibberish)",
+    r?.kind === "parse_error" && r.body.includes("not json"),
+  );
 }
 {
-  const v = await runWithStatus(200, JSON.stringify({}));
-  ok("missing `answers` → null", v === null);
+  const r = await runWithStatus(200, JSON.stringify({}));
+  ok(
+    "missing `answers` → parse_error with reason=missing_answers",
+    r?.kind === "parse_error" && r.reason === "missing_answers",
+  );
 }
 {
-  const v = await runWithStatus(200, JSON.stringify({ answers: {} }));
-  ok("empty `answers` → null (no verdict key)", v === null);
+  const r = await runWithStatus(200, JSON.stringify({ answers: {} }));
+  ok(
+    "empty `answers` map → parse_error with reason=missing_verdict",
+    r?.kind === "parse_error" && r.reason === "missing_verdict",
+  );
 }
 {
-  const v = await runWithStatus(
+  const r = await runWithStatus(
     200,
     JSON.stringify({ answers: { is_dangerous: { type: "noul", noul: 0.5 } } }),
   );
-  ok("verdict answer missing → null", v === null);
+  ok(
+    "verdict answer missing → parse_error with reason=missing_verdict",
+    r?.kind === "parse_error" && r.reason === "missing_verdict",
+  );
 }
 {
-  const v = await runWithStatus(
+  // An unusual choice type (not "choice", not "noul") — verify the parser
+  // distinguishes the two shape failure modes (type mismatch vs missing).
+  const r = await runWithStatus(
     200,
     JSON.stringify({ answers: { verdict: { type: "noul", noul: 0.9 } } }),
   );
-  ok("verdict answer of wrong type → null", v === null);
+  ok(
+    "verdict answer of wrong type → parse_error with reason=wrong_verdict_type=noul",
+    r?.kind === "parse_error" && r.reason === "wrong_verdict_type=noul",
+  );
+}
+{
+  // Body-read failure (e.g. connection reset mid-stream on the response):
+  // we still classify as http_error so the upstream network glitch is
+  // visible, but the body is captured as empty rather than lost.
+  nextStatus = 503;
+  nextResponse = "ignored";
+  nextBodyReadShouldThrow = true;
+  calls = [];
+  globalThis.fetch = mockFetch();
+  const r = await judgeWithFastModel(
+    "https://opencode.ai/zen/v1/systemone",
+    "opencode/jev-1.13-free",
+    "k",
+    5000,
+    "auto",
+    ["x"],
+  );
+  nextBodyReadShouldThrow = false;
+  ok(
+    "HTTP 5xx with body-read failure → http_error (status still captured)",
+    r?.kind === "http_error" && r.status === 503,
+  );
+  ok(
+    "HTTP 5xx with body-read failure → body is empty but not lost",
+    r?.kind === "http_error" && r.body === "",
+  );
 }
 
 // =====================================================================
-// 7. Timeout
+// 7. Body truncation at the audit boundary
 // =====================================================================
 
-section("Timeout — AbortController kicks in");
+section("Body truncation — large bodies get capped at 150 chars + ellipsis");
 
 {
+  const huge = "X".repeat(1000);
+  nextStatus = 500;
   calls = [];
-  nextDelayMs = 200; // > timeout
+  globalThis.fetch = mockFetch();
+  const r = await judgeWithFastModel(
+    "https://opencode.ai/zen/v1/systemone",
+    "opencode/jev-1.13-free",
+    "k",
+    5000,
+    "auto",
+    ["x"],
+  );
+  // Run a separate test for body content
+  nextResponse = huge;
+  const r2 = await judgeWithFastModel(
+    "https://opencode.ai/zen/v1/systemone",
+    "opencode/jev-1.13-free",
+    "k",
+    5000,
+    "auto",
+    ["x"],
+  );
+  ok(
+    "1KB HTTP error body is truncated to 150 chars + trailing ellipsis",
+    r2?.kind === "http_error" && r2.body.length === 151 && r2.body.endsWith("…"),
+  );
+  void r;
+}
+
+// =====================================================================
+// 8. Network errors — discriminated with AbortError vs ECONNRESET etc.
+// =====================================================================
+
+section("Network errors — fetch rejection becomes network_error with kind+message");
+
+{
+  // Timeout: the mock honors the AbortSignal and rejects with
+  // DOMException("aborted", "AbortError").
+  calls = [];
+  nextDelayMs = 200;
   nextResponse = JSON.stringify({
     answers: { verdict: { type: "choice", choice: "ask", confidence: 0.9 } },
   });
   globalThis.fetch = mockFetch();
 
   const start = Date.now();
-  const v = await judgeWithFastModel(
+  const r = await judgeWithFastModel(
     "https://opencode.ai/zen/v1/systemone",
     "opencode/jev-1.13-free",
     "k",
-    50, // 50ms timeout
+    50,
     "auto",
     ["x"],
   );
   const elapsed = Date.now() - start;
 
-  ok("returns null on timeout", v === null);
-  ok("aborted before upstream delay finished", elapsed < 200, `(elapsed=${elapsed}ms)`);
+  ok(
+    "timeout → network_error with AbortError kind",
+    r?.kind === "network_error" && r.errorKind.startsWith("AbortError"),
+  );
+  ok("timeout doesn't hang past the limit", elapsed < 200, `(elapsed=${elapsed}ms)`);
 }
 
 // =====================================================================

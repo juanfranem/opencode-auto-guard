@@ -816,7 +816,7 @@ export default Plugin.define({
               event.resources as string[],
             );
             const fastMs = Date.now() - fastStart;
-            if (fast) {
+            if (fast && fast.kind === "verdict") {
               await writeAudit(
                 ctx,
                 mkAudit(
@@ -853,22 +853,40 @@ export default Plugin.define({
                   ),
                 );
               }
-            } else {
-              // No verdict (error, malformed response, missing key).
-              // Silent unless the key was present — a network blip
-              // shouldn't spam the audit log.
+            } else if (fast) {
+              // Diagnostic telemetry for the non-verdict paths. Each
+              // kind gets its own audit category so the next
+              // intermittent failure can be classified from the kv
+              // table alone, without re-running a probe.
+              let category: string;
+              let extra: string;
+              switch (fast.kind) {
+                case "http_error":
+                  category = "shell_fast_judge_http_error";
+                  extra =
+                    `model=${opts.fastJudgeModel} ms=${fastMs} ` +
+                    `status=${fast.status} body=${fast.body}`;
+                  break;
+                case "parse_error":
+                  category = "shell_fast_judge_parse";
+                  extra =
+                    `model=${opts.fastJudgeModel} ms=${fastMs} ` +
+                    `status=${fast.status} reason=${fast.reason} body=${fast.body}`;
+                  break;
+                case "network_error":
+                  category = "shell_fast_judge_error";
+                  extra =
+                    `model=${opts.fastJudgeModel} ms=${fastMs} ` +
+                    `error=${fast.errorKind} msg=${fast.message}`;
+                  break;
+              }
               await writeAudit(
                 ctx,
-                mkAudit(
-                  event,
-                  event.effect,
-                  "shell_fast_judge_error",
-                  `model=${opts.fastJudgeModel} ms=${fastMs}`,
-                  false,
-                  redactedResources,
-                ),
+                mkAudit(event, event.effect, category, extra, false, redactedResources),
               );
             }
+            // fast === null: caller didn't have a key (gate above
+            // already filters that out). No audit — would be noise.
           }
 
           // Strong LLM judge for ambiguous cases.
