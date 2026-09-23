@@ -82,6 +82,14 @@ export interface FastJudgeResponse {
  * variant is the only one that carries a decision; the others are
  * diagnostic payloads for the audit log so intermittent upstream
  * failures can be categorized without leaving the session.
+ *
+ * `unsure` is its own variant on purpose: Jev's documented "I don't
+ * know" answer (a deliberate escape hatch when the input is too
+ * ambiguous for the structured judge to commit). The plugin must NOT
+ * treat that as a parse error — it routes through the LLM judge
+ * tier instead. Collapsing `unsure` into `parse_error` makes the
+ * downstream code drop the LLM fallback on exactly the cases that
+ * need it most.
  */
 export type FastJudgeResult =
   | {
@@ -90,6 +98,12 @@ export type FastJudgeResult =
       confidence: number;
       reason: string;
       raw: FastJudgeResponse;
+    }
+  | {
+      kind: "unsure";
+      status: number;
+      confidence: number;
+      body: string;
     }
   | {
       kind: "http_error";
@@ -313,6 +327,19 @@ export async function judgeWithFastModel(
 
   const choiceRaw = typeof verdict.choice === "string" ? verdict.choice.toLowerCase() : "";
   if (choiceRaw !== "deny" && choiceRaw !== "ask") {
+    // `unsure` is Jev's documented escape hatch — the model legitimately
+    // couldn't commit to deny/ask. Surface that as its own kind so the
+    // caller can route through the LLM judge tier rather than treating
+    // it as a parse error. Anything else (e.g. a future criterion name)
+    // is genuinely unexpected and stays a parse_error.
+    if (choiceRaw === "unsure") {
+      return {
+        kind: "unsure",
+        status: resp.status,
+        confidence: pickConfidence(verdict),
+        body: auditTruncate(JSON.stringify(data.answers)),
+      };
+    }
     return {
       kind: "parse_error",
       status: resp.status,
