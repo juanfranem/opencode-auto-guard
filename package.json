@@ -1,6 +1,6 @@
 {
   "name": "@juanfranem/opencode-auto-guard",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "Multi-layer guard plugin for OpenCode v2 — stops dangerous shell commands, web requests, and file edits before the agent runs them.",
   "license": "MIT",
   "type": "module",
