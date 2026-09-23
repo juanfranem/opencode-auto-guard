@@ -56,6 +56,7 @@ import {
   defaultTempDir,
   rawDumpPath,
   TMP_DIR_AUDIT_CATEGORY,
+  expandEnvPlaceholder,
   type Decision,
   type SessionState,
 } from "./rules";
@@ -64,7 +65,7 @@ import { registerAutoAgent } from "./agent-registration";
 // ============== Plugin metadata ==============
 
 export const PLUGIN_NAME = "opencode-auto-guard";
-export const PLUGIN_VERSION = "0.1.2";
+export const PLUGIN_VERSION = "0.1.4";
 
 // ============== Defaults ==============
 
@@ -213,20 +214,42 @@ function readStringArray(v: unknown): string[] | undefined {
   return v as string[];
 }
 
+/**
+ * Read a string plugin option and expand `{env:VAR}` placeholders. Used
+ * for any option that the user might want to source from an env var
+ * without leaking the literal placeholder into the runtime (the API key,
+ * model id, paths, etc.). Strings that aren't placeholders are returned
+ * verbatim — we only rewrite `{env:VAR}` shapes.
+ */
+function readEnvString(v: unknown): string | undefined {
+  if (typeof v !== "string") return undefined;
+  return expandEnvPlaceholder(v);
+}
+
 function resolveOptions(ctx: any): ResolvedOptions {
   const o = ctx.options ?? {};
-  const explicitKey =
-    typeof o.fastJudgeApiKey === "string" && o.fastJudgeApiKey.length > 0
-      ? o.fastJudgeApiKey
-      : undefined;
-  const envKey =
+  // Resolve string options that may carry `{env:VAR}` placeholders.
+  // We bind them up-front so the return-object can re-use them without
+  // either re-parsing the placeholder or relying on a non-null
+  // assertion (which biome's `noNonNullAssertion` rule rejects).
+  const judgeModel = readEnvString(o.model);
+  const pin = readEnvString(o.pin);
+  const compactSessionsDirRaw = readEnvString(o.compactSessionsDir);
+  const tempDirRaw = readEnvString(o.tempDir);
+  const fastJudgeModel = readEnvString(o.fastJudgeModel);
+  const fastJudgeEndpoint = readEnvString(o.fastJudgeEndpoint);
+  const fastJudgeApiKey = readEnvString(o.fastJudgeApiKey);
+  // If the explicit option did not yield a key, fall back to the legacy
+  // `OPENCODE_ZEN_API_KEY` env var so users who already configured that
+  // name are not broken by this change.
+  const envFallbackKey =
     typeof process.env.OPENCODE_ZEN_API_KEY === "string" &&
     process.env.OPENCODE_ZEN_API_KEY.length > 0
       ? process.env.OPENCODE_ZEN_API_KEY
       : undefined;
   return {
     judge: readBool(o.judge, true),
-    judgeModel: typeof o.model === "string" ? o.model : undefined,
+    judgeModel,
     strictBuild: readBool(o.strictBuild, true),
     trustedDomains: readStringArray(o.trustedDomains) ?? defaultTrustedDomains(),
     protectedPaths: readStringArray(o.protectedPaths) ?? defaultProtectedPaths(),
@@ -234,25 +257,15 @@ function resolveOptions(ctx: any): ResolvedOptions {
     maxActions: readNumber(o.maxActions, DEFAULT_LIMITS.maxActions),
     maxContextUsage: readNumber(o.maxContextUsage, DEFAULT_LIMITS.maxContextUsage),
     maxDurationMs: readNumber(o.maxDurationMs, DEFAULT_LIMITS.maxDurationMs),
-    pin: typeof o.pin === "string" ? o.pin : undefined,
-    compactSessionsDir:
-      typeof o.compactSessionsDir === "string" && o.compactSessionsDir.length > 0
-        ? path.resolve(o.compactSessionsDir)
-        : defaultCompactSessionsDir(),
+    pin,
+    compactSessionsDir: compactSessionsDirRaw
+      ? path.resolve(compactSessionsDirRaw)
+      : defaultCompactSessionsDir(),
     compactOnContextGuard: readBool(o.compactOnContextGuard, true),
-    tempDir:
-      typeof o.tempDir === "string" && o.tempDir.length > 0
-        ? path.resolve(o.tempDir)
-        : defaultTempDir(),
-    fastJudgeModel:
-      typeof o.fastJudgeModel === "string" && o.fastJudgeModel.length > 0
-        ? o.fastJudgeModel
-        : undefined,
-    fastJudgeEndpoint:
-      typeof o.fastJudgeEndpoint === "string" && o.fastJudgeEndpoint.length > 0
-        ? o.fastJudgeEndpoint
-        : "https://opencode.ai/zen/v1/systemone",
-    fastJudgeApiKey: explicitKey ?? envKey,
+    tempDir: tempDirRaw ? path.resolve(tempDirRaw) : defaultTempDir(),
+    fastJudgeModel,
+    fastJudgeEndpoint: fastJudgeEndpoint ?? "https://opencode.ai/zen/v1/systemone",
+    fastJudgeApiKey: fastJudgeApiKey ?? envFallbackKey,
     fastJudgeTimeoutMs: readNumber(o.fastJudgeTimeoutMs, 5000),
     fastJudgeConfidenceDeny: readClamped(o.fastJudgeConfidenceDeny, 0.75, 0, 1),
     fastJudgeConfidenceAsk: readClamped(o.fastJudgeConfidenceAsk, 0.6, 0, 1),
@@ -540,11 +553,28 @@ export default Plugin.define({
     //      diagnosing "I set the option but nothing happens" — the audit
     //      log makes it visible whether the key was found.
     if (opts.fastJudgeModel) {
-      const keySource = process.env.OPENCODE_ZEN_API_KEY
-        ? "env"
-        : ctx.options?.fastJudgeApiKey
-          ? "option"
-          : "missing";
+      // Report which source actually produced the token (or that none did).
+      // `expandEnvPlaceholder` is run a second time here so the message
+      // tells the user which env var name they used — e.g. a misnamed
+      // `OPENCODE_ZEN_TOEKN` is much easier to spot in the audit than
+      // a generic "missing".
+      const rawOption =
+        typeof ctx.options?.fastJudgeApiKey === "string" ? ctx.options.fastJudgeApiKey : undefined;
+      const placeholderMatch = rawOption?.match(/^\{env:([A-Za-z_$][A-Za-z0-9_$]*)\}$/);
+      const effectiveKey = opts.fastJudgeApiKey;
+      let keySource: string;
+      if (effectiveKey) {
+        if (placeholderMatch) keySource = `env:${placeholderMatch[1]}`;
+        else if (process.env.OPENCODE_ZEN_API_KEY === effectiveKey)
+          keySource = "env:OPENCODE_ZEN_API_KEY";
+        else keySource = "option:raw";
+      } else if (rawOption && placeholderMatch) {
+        keySource = `env:${placeholderMatch[1]}=missing`;
+      } else if (rawOption) {
+        keySource = "option:empty";
+      } else {
+        keySource = "missing";
+      }
       await writeAudit(
         ctx,
         mkAudit(
