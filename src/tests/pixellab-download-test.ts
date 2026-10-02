@@ -70,6 +70,68 @@ try {
     validatePixellabDownloadInput({ objectId: id, filename: "asset_1.png" }).filename ===
       "asset_1.png",
   );
+  ok(
+    "legacy input retains exactly its original fields",
+    JSON.stringify(validatePixellabDownloadInput({ objectId: id, filename: "asset_1.png" })) ===
+      JSON.stringify({ objectId: id, filename: "asset_1.png" }),
+  );
+  for (const resourceType of ["map-object", "image"] as const) {
+    ok(
+      `accepts explicit ${resourceType}`,
+      validatePixellabDownloadInput({ objectId: id, filename: "a.png", resourceType })
+        .resourceType === resourceType,
+    );
+  }
+  for (const resourceType of [
+    "images",
+    "map-objects",
+    "IMAGE",
+    "",
+    1,
+    true,
+    null,
+    undefined,
+    {},
+    [],
+  ]) {
+    const input = { objectId: id, filename: "invalid.png", resourceType };
+    let rejected = false;
+    try {
+      validatePixellabDownloadInput(input);
+    } catch {
+      rejected = true;
+    }
+    ok(`rejects explicitly supplied resourceType ${String(resourceType)}`, rejected);
+  }
+  for (const input of [
+    ...["images", 1, true, null, undefined, {}, []].map((resourceType) => ({
+      objectId: id,
+      filename: "invalid.png",
+      resourceType,
+    })),
+    { objectId: id, filename: "invalid.png", resourceType: "image", url: "https://evil.test" },
+    { objectId: id, filename: "invalid.png", resourceType: "map-object", extra: 1 },
+    { objectId: id, filename: "invalid.png", extra: 1 },
+  ]) {
+    let fetched = false;
+    let error = "";
+    try {
+      await downloadPixellabPng(input, path.join(sandbox, "not-created"), [], {
+        fetch: async () => {
+          fetched = true;
+          return response();
+        },
+      });
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : String(cause);
+    }
+    ok(
+      "invalid input rejected before filesystem root checks or network",
+      /Invalid Pixellab resourceType|unknown fields/.test(error) &&
+        !fetched &&
+        !(await fs.stat(path.join(sandbox, "not-created")).catch(() => undefined)),
+    );
+  }
   for (const bad of [
     null,
     { objectId: id, filename: "../x.png" },
@@ -94,6 +156,22 @@ try {
     "builds fixed URL",
     buildPixellabDownloadUrl(id) === `https://api.pixellab.ai/mcp/map-objects/${id}/download`,
   );
+  ok(
+    "explicit map-object preserves fixed URL",
+    buildPixellabDownloadUrl(id, "map-object") ===
+      `https://api.pixellab.ai/mcp/map-objects/${id}/download`,
+  );
+  ok(
+    "image builds fixed images URL",
+    buildPixellabDownloadUrl(id, "image") === `https://api.pixellab.ai/mcp/images/${id}/download`,
+  );
+  let wrongEnumRejected = false;
+  try {
+    buildPixellabDownloadUrl(id, "images" as never);
+  } catch {
+    wrongEnumRejected = true;
+  }
+  ok("URL helper rejects wrong enum directly", wrongEnumRejected);
 
   for (const invalid of [
     mutateChunk("IHDR", (body) => body.writeUInt32BE(401, 0)),
@@ -137,6 +215,96 @@ try {
     "uses safe GET options",
     seen?.method === "GET" && seen.redirect === "error" && seen.credentials === "omit",
   );
+  let imageUrl = "";
+  let imageInit: RequestInit | undefined;
+  const image = await downloadPixellabPng(
+    { objectId: id, filename: "image.png", resourceType: "image" },
+    root,
+    [],
+    {
+      fetch: async (url, init) => {
+        imageUrl = String(url);
+        imageInit = init;
+        return response();
+      },
+    },
+  );
+  ok(
+    "image download fetches exact fixed URL",
+    imageUrl === `https://api.pixellab.ai/mcp/images/${id}/download`,
+  );
+  ok(
+    "image download writes validated PNG",
+    image.bytes === png.length && (await fs.readFile(image.path)).equals(png),
+  );
+  ok(
+    "image uses safe GET options",
+    imageInit?.method === "GET" &&
+      imageInit.redirect === "error" &&
+      imageInit.credentials === "omit",
+  );
+
+  for (const [name, imageRoot, protectedPaths, filename] of [
+    ["existing target", root, [], "image.png"],
+    ["relative root", "relative", [], "unsafe-image.png"],
+    ["missing root", path.join(sandbox, "missing-image"), [], "unsafe-image.png"],
+    ["noncanonical root", `${root}/../root`, [], "unsafe-image.png"],
+    ["protected root", root, [root], "unsafe-image.png"],
+  ] as const) {
+    let fetched = false;
+    let rejected = false;
+    try {
+      await downloadPixellabPng(
+        { objectId: id, filename, resourceType: "image" },
+        imageRoot,
+        protectedPaths,
+        {
+          fetch: async () => {
+            fetched = true;
+            return response();
+          },
+        },
+      );
+    } catch {
+      rejected = true;
+    }
+    ok(`image rejects ${name} before network`, rejected && !fetched);
+  }
+  ok("image existing target unchanged", (await fs.readFile(image.path)).equals(png));
+  ok(
+    "image safety failures leave no target",
+    !(await fs.stat(path.join(root, "unsafe-image.png")).catch(() => undefined)),
+  );
+  for (const throwsRedirect of [false, true]) {
+    let rejected = false;
+    let safeRedirect = false;
+    try {
+      await downloadPixellabPng(
+        { objectId: id, filename: "image-redirect.png", resourceType: "image" },
+        root,
+        [],
+        {
+          fetch: async (_url, init) => {
+            safeRedirect = init?.redirect === "error";
+            if (throwsRedirect) throw new TypeError("redirect");
+            return response(
+              png,
+              { "content-type": "image/png", location: "https://evil.test" },
+              302,
+            );
+          },
+        },
+      );
+    } catch {
+      rejected = true;
+    }
+    ok(
+      "image refuses redirects without writing",
+      rejected &&
+        safeRedirect &&
+        !(await fs.stat(path.join(root, "image-redirect.png")).catch(() => undefined)),
+    );
+  }
 
   await fs.writeFile(path.join(root, "existing.png"), "keep");
   let network = false;

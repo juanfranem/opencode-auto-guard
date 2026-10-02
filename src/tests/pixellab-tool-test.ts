@@ -60,6 +60,24 @@ ok("dedicated namespace", namespaces[0] === "auto_guard");
 const tool = tools[0];
 ok("stable tool name", tool?.name === "download_pixellab_png");
 ok("dedicated permission action", tool?.options?.permission === PIXELLAB_DOWNLOAD_PERMISSION);
+ok("permission action remains unchanged", PIXELLAB_DOWNLOAD_PERMISSION === "pixellab_download");
+const schema = tool?.input as
+  | {
+      properties?: Record<string, { type?: string; enum?: string[] }>;
+      required?: string[];
+      additionalProperties?: boolean;
+    }
+  | undefined;
+ok(
+  "resourceType schema allows only map-object and image",
+  schema?.properties?.resourceType?.type === "string" &&
+    JSON.stringify(schema.properties.resourceType.enum) === JSON.stringify(["map-object", "image"]),
+);
+ok(
+  "resourceType stays optional and unknown fields forbidden",
+  JSON.stringify(schema?.required) === JSON.stringify(["objectId", "filename"]) &&
+    schema?.additionalProperties === false,
+);
 ok("exposed to Code Mode", tool?.options?.codemode === true);
 ok("global allow still requires confirmation", pixellabDownloadEffect("allow") === "ask");
 ok("ask remains ask", pixellabDownloadEffect("ask") === "ask");
@@ -82,16 +100,19 @@ if (tool) {
 
 const root = await fs.mkdtemp(path.join(os.tmpdir(), "pixellab-tool-"));
 const originalFetch = globalThis.fetch;
+const fetchedUrls: string[] = [];
 try {
   globalThis.fetch = Object.assign(
-    async () =>
-      new Response(
+    async (url: string | URL | Request) => {
+      fetchedUrls.push(String(url));
+      return new Response(
         Buffer.from(
           "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
           "base64",
         ),
         { headers: { "content-type": "image/png" } },
-      ),
+      );
+    },
     { preconnect: originalFetch.preconnect },
   );
   await registerPixellabDownloadTool(ctx, root, [], async (_context, status) => {
@@ -109,8 +130,35 @@ try {
   );
   ok("successful execution is audited", audit.join(",") === "failed,completed");
   ok(
+    "legacy execution retains map-object endpoint",
+    fetchedUrls[0] ===
+      "https://api.pixellab.ai/mcp/map-objects/a4f416f2-0749-4b9a-90e3-b05c9b238819/download",
+  );
+  ok(
     "result reports local filename",
     typeof result.content === "string" && result.content.includes("economy.png"),
+  );
+  const imageResult = await registered.execute(
+    {
+      objectId: "a4f416f2-0749-4b9a-90e3-b05c9b238819",
+      filename: "edited.png",
+      resourceType: "image",
+    },
+    { sessionID: "test", agent: "auto" } as never,
+  );
+  ok(
+    "registered image executor uses fixed images endpoint",
+    fetchedUrls[1] ===
+      "https://api.pixellab.ai/mcp/images/a4f416f2-0749-4b9a-90e3-b05c9b238819/download",
+  );
+  ok(
+    "registered image executor writes configured root",
+    (await fs.stat(path.join(root, "edited.png"))).isFile(),
+  );
+  ok("image execution success is audited", audit.join(",") === "failed,completed,completed");
+  ok(
+    "image result reports local filename",
+    typeof imageResult.content === "string" && imageResult.content.includes("edited.png"),
   );
 } finally {
   globalThis.fetch = originalFetch;

@@ -138,7 +138,10 @@ session limits nor the confirmation boundary. Download outcomes are audited with
 recording the UUID/access-key or raw destination input.
 
 Input contains only a strict UUID and PNG basename. The URL is constructed as
-`https://api.pixellab.ai/mcp/map-objects/<UUID>/download`; arbitrary hosts, URLs,
+`https://api.pixellab.ai/mcp/map-objects/<UUID>/download` by default, or
+`https://api.pixellab.ai/mcp/images/<UUID>/download` when the strict optional
+`resourceType` enum is `image`. Only `map-object` and `image` are accepted; a raw
+path/collection cannot be supplied. Both modes share all protections. Arbitrary hosts, URLs,
 queries, fragments, headers, bodies, filename traversal and Windows device names
 cannot be expressed. GET uses `redirect: error`, `credentials: omit`, and a
 30-second network timeout. Streamed bytes are capped at 1 MiB regardless of headers.
