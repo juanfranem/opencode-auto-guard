@@ -26,6 +26,61 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 - Adversarial downloader and tool registration/permission regression tests, plus a
   `safe-download-test.ts` suite covering the generic primitive with a fake spec.
 
+## [0.2.0] — 2026-10-02
+
+### Breaking
+
+- The `pixellabDownloadRoot` option is gone. Move it to the equivalent
+  `downloads.pixellab` entry. There is no compatibility alias.
+
+- `safeDownloadFile` now requires the adapter to declare
+  `expectedContentType` (no longer hardcoded to `image/png`). Existing
+  custom adapters must add the field.
+
+### Added
+
+- `downloads` map: each entry declares a fixed-origin, confirmation-only
+  download tool (`auto_guard_download_<id>`) with its own permission
+  (`<id>_download`) and audit category. User knobs are small and closed:
+  `enabled`, `root`, `host`, `pathTemplate`, `expectedContentType`,
+  `contentValidator`, `maxBytes`, `timeoutMs`, `fields`. Field shapes
+  are closed too: `uuid`, `num`, `slug`, `hex32`, `hex64`, or
+  `{ enum: [...] }`. The LLM cannot smuggle a `/`, `?`, `#` or NUL
+  into a placeholder; the regexes refuse them.
+
+- `src/content-validators.ts`: closed palette of named content
+  validators. `png` (strict: CRC, IHDR ≤ 400×400, IDAT/IEND, scanline
+  filters), `jpeg` (SOI/EOI + SOF dim ≤ 400×400), `webp` (RIFF/WEBP
+  + VP8/VP8L/VP8X dim ≤ 400×400), `text/plain` (strict UTF-8, no NUL),
+  `none` (identity; defers to header + size cap). Adding a validator
+  is a code change — JSON-shaped config cannot.
+
+- `src/download-adapter.ts`: compiles a `DownloadAdapterConfig` into a
+  `SafeDownloadSpec`. Rejects malformed host, unknown fields, unknown
+  placeholders, missing placeholders, bad content types, unknown content
+  validator names — all at startup. Compile errors are surfaced as
+  `<id>_download_compile_failed` audit rows without aborting the rest of
+  the plugin.
+
+- `src/download-tool.ts`: registers `auto_guard_download_<id>` in the
+  `auto_guard` Code Mode namespace. Permission effect is forced to `ask`
+  (preserves `deny`), identical to the previous pixellab policy. Adapter
+  permissions do not participate in shell allowlist elevation.
+
+- New test files `content-validators-test.ts`, `download-adapter-test.ts`,
+  `download-tool-test.ts`. Adversarial coverage of every config seam, every
+  shape regex, and the executor against stubbed `fetch`.
+
+### Changed
+
+- `src/safe-download.ts` `SafeDownloadSpec` exposes a per-adapter
+  `expectedContentType`; `readBoundedResponse` enforces exact-match
+  rather than the hardcoded `image/png`.
+- `package.json` `files` now ships the generic modules and removes the
+  pixellab-specific ones.
+
+## [0.1.3] — 2026-09-22
+
 ## [0.1.3] — 2026-09-22
 
 ### Added

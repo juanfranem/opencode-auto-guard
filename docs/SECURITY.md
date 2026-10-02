@@ -129,60 +129,90 @@ defends against malicious tool calls that exploit over-permissive config.
   `guard:audit-archive-${date}-${n}` keys with a pointer record so the
   chain can be reconstructed across rotations.
 
-## Dedicated PixelLab downloader
+## Generic, declarative download adapters
 
-`pixellabDownloadRoot` enables an isolated tool; it does not introduce an exception
-to `HARD_DENY` or expand `trustedDomains`. Its permission action `pixellab_download`
-is always escalated to `ask` (an existing `deny` is preserved), bypassing neither
-session limits nor the confirmation boundary. Download outcomes are audited without
-recording the UUID/access-key or raw destination input.
+Each entry of the `downloads` map enables one opt-in tool named
+`auto_guard_download_<id>`, with permission `<id>_download`. Permissions do
+NOT introduce an exception to `HARD_DENY`, do NOT expand `trustedDomains`,
+and are always escalated to `ask` (an existing `deny` is preserved). They
+bypass neither session limits nor the confirmation boundary. Each call is
+audited under `<id>_download_permission` and `<id>_download_result`
+without recording UUIDs, slug keys, or raw destination input.
 
-Input contains only a strict UUID and PNG basename. The URL is constructed as
-`https://api.pixellab.ai/mcp/map-objects/<UUID>/download` by default, or
-`https://api.pixellab.ai/mcp/images/<UUID>/download` when the strict optional
-`resourceType` enum is `image`. Only `map-object` and `image` are accepted; a raw
-path/collection cannot be supplied. Both modes share all protections. Arbitrary hosts, URLs,
-queries, fragments, headers, bodies, filename traversal and Windows device names
-cannot be expressed. GET uses `redirect: error`, `credentials: omit`, and a
-30-second network timeout. Streamed bytes are capped at 1 MiB regardless of headers.
-Only HTTP 200 `image/png` is accepted. PNG checks cover signature, header, dimensions
-up to 400 × 400, chunk bounds/CRCs/order and bounded decompression with scanline
-size/filter checks. Interlaced images are conservatively refused; this is not a
-general-purpose image decoder or malware scanner.
+The user-facing knobs are closed and small on purpose: a JSON config
+cannot invent a new code path. Inputs are restricted to a strict
+key/value shape per field (`"uuid" | "num" | "slug" | "hex32" | "hex64"
+| { "enum": [...] }`); the regexes never match `/`, `?`, `#`, `\`,
+whitespace or NUL, and the LLM cannot smuggle a path fragment into a
+placeholder. The path template is a literal `/path` with `{key}`
+placeholders that MUST match declared field names; unknown or missing
+placeholders fail compilation. The destination directory is the only
+filesystem side effect, and the host is fixed in config — never
+parameterized at call time.
 
-The existing absolute destination directory must be user-owned and not accessible
-for modification by untrusted processes. Network/device roots, symlink ancestors
-and protected paths are refused. Directory identity is checked again after download
-and after opening the destination. Exclusive creation prevents overwriting any
-existing target, including a file another download created concurrently. Failed
-writes clean up only the identity obtained by the exclusive open, never a prior file.
+Content shape is fixed per value of `contentValidator` to one of the
+shipped palette:
 
-These are defense-in-depth filesystem checks, not OS sandboxing: a privileged or
-hostile local process able to rename directory ancestors between syscalls is outside
-the guarantee. Symlinks/junctions, canonical path and inode identity differences are
-checked; the plugin does not enumerate every Windows reparse-point tag. Use an
-ordinary local directory rather than virtual/cloud-backed storage. Only the network
-phase has a deadline; OS filesystem calls are not forcibly terminated with a racing
-timer, which could leave writes running after cleanup. The executor performs stricter
-path checks than the generic file-tool hook, so the generic `execute.before` hook is
-not used for this tool. Newer tool contexts expose a cancellation signal; older SDKs retain
-the bounded timeout but cannot propagate session cancellation to the executor.
-Remote data is never executed. Users must review assets before integrating them.
+- `png`: signature, IHDR (width × height ≤ 400), non-interlaced, depth
+  / colour / channels table, IDAT/IEND order, chunk CRCs, scanline
+  size and filter range after zlib inflation.
+- `jpeg`: SOI/EOI, SOF segment width and height ≤ 400; entropy
+  decoding is NOT attempted, but post-SOF scanning rejects payloads
+  with no EOI.
+- `webp`: RIFF/WEBP header, VP8/VP8L/VP8X dim ≤ 400; the validator
+  walks chunks but does not decode entropy, so non-image data is
+  rejected as "Unknown WebP chunk".
+- `text/plain`: strict UTF-8 (fatal decode), no NUL bytes.
+- `none`: identity; defers to `expectedContentType` + size cap.
+
+Adding a new validator is a code change shipped in the plugin; the
+config cannot. The defense contract that ALL content validators
+inherit:
+
+- `image/png`-shaped (or whichever `expectedContentType` the adapter
+  declared) content-type header — anything else is rejected.
+- Streamed body capped at 1 MiB regardless of headers.
+- 30-second network timeout (configurable per adapter up to 60s).
+- GET only, `redirect: error`, `credentials: omit`.
+- Absolute, non-network, no-dot-segment destination root.
+- Symlink / junction ancestor walk rejected.
+- Canonical path + inode identity checked before, during, and after
+  download.
+- `protectedPaths` rejected at the root and the destination.
+- Exclusive `O_CREAT | O_EXCL` write — never overwrites an existing
+  target, including a file another concurrent call created.
+- Failed writes clean up only the inode obtained by our exclusive
+  open, never a prior file.
+
+These are defense-in-depth filesystem checks, not OS sandboxing: a
+privileged or hostile local process able to rename directory ancestors
+between syscalls is outside the guarantee. Symlinks/junctions,
+canonical path and inode identity differences are checked; the plugin
+does not enumerate every Windows reparse-point tag. Use an ordinary
+local directory rather than virtual/cloud-backed storage. Only the
+network phase has a deadline; OS filesystem calls are not forcibly
+terminated with a racing timer, which could leave writes running
+after cleanup. The executor performs stricter path checks than the
+generic file-tool hook, so the generic `execute.before` hook is not
+used for these tools. Newer tool contexts expose a cancellation signal;
+older SDKs retain the bounded timeout but cannot propagate session
+cancellation to the executor. Remote data is never executed. Users
+must review assets before integrating them.
 
 ## Generic `safe-download` primitive
 
-`src/safe-download.ts` is the source-agnostic primitive (`safeDownloadFile`) that
-backs the pixellab adapter. It owns the cross-adapter defense contract: absolute
-non-network download root, no dot segments, symlink/junction-free ancestor walk,
-canonical path and inode identity check, fixed-origin GET with `redirect: error` and
-`credentials: omit`, configurable network timeout, streamed size cap (1 MiB by
-default), `image/png`-shaped content-type, exclusive `O_CREAT | O_EXCL` write,
-post-write identity recheck, and cleanup that only removes the inode our own open
-created. Any future adapter (asset packs, signed releases, etc.) reuses this primitive
-by supplying three pure functions: `validateInput`, `buildUrl`, and `validateContent`.
-The pixellab layer is exactly such an adapter — it adds UUID/PNG-basename input
-strictness, the fixed PixelLab URL, and the bounded PNG decoder, and calls
-`safeDownloadFile` with no other behavior.
+`src/safe-download.ts` is the source-agnostic primitive (`safeDownloadFile`)
+that backs every download adapter. It owns the cross-adapter defense
+contract: non-network download root, no dot segments, symlink-free
+ancestor walk, canonical path + inode identity check, fixed-origin GET
+with `redirect: error` and `credentials: omit`, configurable network
+timeout, streamed size cap (1 MiB), exact-match `expectedContentType`
+content-type, exclusive `O_CREAT | O_EXCL` write, post-write identity
+recheck, and cleanup that only removes the inode our own open created.
+Adapters compose this primitive by supplying `validateInput`,
+`buildUrl`, and a content validator (chosen from the closed palette in
+`src/content-validators.ts`). The adapter layer is the only place that
+sees the host and the path template; the primitive never sees them.
 
 ## What is NOT covered
 

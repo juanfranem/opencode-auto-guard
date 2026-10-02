@@ -157,7 +157,7 @@ Then restart OpenCode — options are read once at startup.
 | `model` | string | default model | Model used by the LLM judge. Format: `provider/model`. |
 | `strictBuild` | bool | `true` | In `build` agent, force `ask` on `ALWAYS_ASK` patterns even if global config would allow. |
 | `trustedDomains` | string[] | built-in list | Hosts that pass through `webfetch` / `websearch` and shell network without asking. |
-| `pixellabDownloadRoot` | string | disabled | Existing absolute directory for the confirmation-required PixelLab PNG downloader. Does not relax shell rules or depend on `trustedDomains`. |
+| `downloads` | map\<id, DownloadAdapterConfig> | disabled | Per-adapter confirmation-only download tools (PixelLab, asset packs, signed releases). See **Safe downloads (opt-in, per-adapter)** below. |
 | `protectedPaths` | string[] | plugin files | Absolute paths denied for `read` / `edit` / `write`. |
 | `maxDenials` | number | `3` | Session pauses after this many denials. |
 | `maxActions` | number | `250` | Session pauses after this many counted actions. |
@@ -167,67 +167,114 @@ Then restart OpenCode — options are read once at startup.
 | `tempDir` | string | `~/.config/opencode/opencode-auto-guard/tmp` | Scratch directory for the `auto` agent (compiled artefacts, fixtures, logs). Created on startup. |
 | `pin` | string | unset | SHA-256 of `index.ts` + `rules.ts`. If set and mismatch → plugin disables. |
 
-### Safe PixelLab PNG downloads (opt-in)
+### Safe downloads (opt-in, per-adapter)
 
-`Invoke-WebRequest` stays in `HARD_DENY`. Adding `api.pixellab.ai` to
-`trustedDomains` does not override that block. For approved map-object or edited-image assets,
-enable the dedicated tool instead. Add this option to the existing plugin entry;
-do not replace your other options:
+`Invoke-WebRequest` stays in `HARD_DENY`. Adding a host to `trustedDomains`
+does not override that block. For approved assets from a specific origin
+that you trust, declare a download adapter instead. Each entry in the
+`downloads` map produces:
 
-The downloader is a thin adapter over the source-agnostic `safeDownloadFile`
-primitive in `src/safe-download.ts` (bounded fetch, identity-checked exclusive
-write, exhaustive path / symlink / ancestor defenses). Any future download
-adapter — map tiles, asset packs, signed releases — reuses the same primitive
-by supplying its own `validateInput`, `buildUrl`, and `validateContent`.
+- one tool named `auto_guard_download_<id>` in the `auto_guard` Code Mode namespace;
+- one permission `<id>_download` that always escalates to `ask` and preserves `deny`;
+- one audit category `<id>_download_permission` / `<id>_download_result` so a single
+  adapter's traffic is queryable independently.
+
+The adapter is a thin declarative config over the source-agnostic
+`safeDownloadFile` primitive in `src/safe-download.ts` (bounded fetch,
+identity-checked exclusive write, exhaustive path / symlink / ancestor
+defenses). Every adapter reuses the same primitive.
+
+PixelLab map-objects / edited-images:
 
 ```jsonc
-"pixellabDownloadRoot": "C:/Users/bjfem/Desktop/workspace/kingdom-simulator/src/assets/icons/stats"
+{
+  "downloads": {
+    "pixellab": {
+      "enabled": true,
+      "root": "C:/Users/bjfem/Desktop/workspace/kingdom-simulator/src/assets/icons/stats",
+      "host": "api.pixellab.ai",
+      "pathTemplate": "/mcp/{collection}/{objectId}/download",
+      "expectedContentType": "image/png",
+      "contentValidator": "png",
+      "fields": {
+        "objectId":   { "shape": "uuid" },
+        "collection": { "shape": { "enum": ["map-objects", "images"] } }
+      }
+    }
+  }
+}
 ```
 
-Create the directory yourself first, keep it owned by you, and restart OpenCode.
-The tool is exposed as `auto_guard_download_pixellab_png` (namespace `auto_guard`
-in Code Mode). Input:
+Tool input:
 
 ```json
 {
   "objectId": "a4f416f2-0749-4b9a-90e3-b05c9b238819",
-  "filename": "economy.png"
+  "filename": "economy.png",
+  "collection": "map-objects"
 }
 ```
 
-Every call requests confirmation, even in Auto mode or with an `allow` rule;
-an existing `deny` remains a denial. Session limits still apply. The tool accepts
-only a UUID, a lowercase PNG basename and an optional `resourceType` enum. It constructs the exact PixelLab HTTPS
-download URL internally, performs GET with no redirects or credentials, limits
-network time to 30 seconds and response size to 1 MiB, validates non-interlaced
-PNG data (up to 400 × 400, chunk CRCs and bounded inflated scanlines), and creates
-the file exclusively.
-It never overwrites an existing file. Root/path checks reject protected paths
-and symlink ancestors. No shell commands, arbitrary URLs, headers or paths are
-accepted as input. This downloads existing assets; it does not generate them.
+A second, non-PixelLab example — signed text manifest pack:
 
-For edited images returned by `get_image`, supply the **job UUID**, not the Creator
-gallery asset ID, and explicitly choose the image collection:
-
-```json
+```jsonc
 {
-  "objectId": "acc48249-a91c-455d-8bfd-0f16a69fb2b5",
-  "filename": "king-worried.png",
-  "resourceType": "image"
+  "downloads": {
+    "manifests": {
+      "enabled": false,
+      "root": "C:/Users/bjfem/Desktop/workspace/kingdom-simulator/src/assets/manifests",
+      "host": "releases.example.test",
+      "pathTemplate": "/v1/{owner}/{repo}/{tag}.txt",
+      "expectedContentType": "text/plain",
+      "contentValidator": "text/plain",
+      "maxBytes": 65536,
+      "fields": {
+        "owner": { "shape": "slug" },
+        "repo":  { "shape": "slug" },
+        "tag":   { "shape": "slug" }
+      }
+    }
+  }
 }
 ```
 
-`resourceType` accepts only `map-object` or `image`; omission retains the original
-map-object behavior. The URL is fixed to `/mcp/map-objects/<UUID>/download` or
-`/mcp/images/<UUID>/download`, respectively, on the exact `api.pixellab.ai` HTTPS
-host. User-supplied URLs, path fragments and other collections remain rejected.
-Image mode uses the same confirmation and all filesystem/PNG/network protections.
-Restart OpenCode after upgrading the plugin to expose the new tool argument.
+The contract (security model is the same for every adapter; only the
+fields and the validator change):
 
-The directory must already exist, be absolute, and not be writable by untrusted
-users/processes. Cross-platform filesystem checks cannot sandbox a hostile local
-process that can replace directory ancestors concurrently. Approval is not an
-assertion that remote content is trustworthy; do not execute downloaded files.
+- `enabled` (default false): only `true` registers the tool. Set `false`
+  to disable without removing the entry.
+- `root` must be absolute, non-network, no dot segments. Create the
+  directory yourself first, keep it owned by you. Restart OpenCode to
+  pick up changes.
+- `host` must be a single literal lowercase hostname (no scheme, port,
+  path or userinfo). Anything else is rejected at startup.
+- `pathTemplate` is a literal `/path` with `{key}` placeholders. Each
+  placeholder MUST correspond to a field declared in `fields`; missing
+  or unknown placeholders fail compilation.
+- `expectedContentType` is matched exactly on the response
+  `content-type` header. `contentValidator` runs after that.
+- `maxBytes` (default 1 MiB) and `timeoutMs` (default 30s, hard ceiling
+  60s) bound the streamed body and the abort budget.
+- `fields` declare each input field by name, with its shape. Closed
+  palette: `"uuid" | "num" | "slug" | "hex32" | "hex64" | { "enum": [...] }`.
+  Shape regexes never match `/`, `?`, `#`, `\`, whitespace, or NUL —
+  the LLM cannot smuggle a path fragment into a placeholder value.
+- `contentValidator` is one of the shipped palette: `"png"` (strict:
+  CRC, IHDR ≤ 400×400, IDAT/IEND, scanline filters), `"jpeg"` (SOI/EOI
+  + SOF dim ≤ 400×400), `"webp"` (RIFF/WEBP + VP8/VP8L/VP8X dim
+  ≤ 400×400), `"text/plain"` (strict UTF-8, NUL-rejected), `"none"`
+  (identity; defers to header + size cap). Adding a new validator is a
+  code change — JSON-shaped config cannot invent new code.
+
+Every call requests confirmation, even in Auto mode or with an `allow`
+rule; an existing `deny` remains a denial. Session limits still apply.
+No shell commands, arbitrary URLs, headers or paths are accepted as
+input. These tools download existing assets; they do not generate them.
+Approval is not an assertion that remote content is trustworthy; do not
+execute downloaded files.
+
+**Migration from v0.0.x–v0.1.x:** the old `pixellabDownloadRoot` option
+is gone. Move it to the equivalent `downloads.pixellab` entry.
 
 When developing a plugin configured with a Git package reference, uncommitted
 working-tree changes are not loaded from the cached Git dependency. To test this
