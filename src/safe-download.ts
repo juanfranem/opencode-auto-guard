@@ -3,13 +3,15 @@
 // Generic primitive for downloading a single, bounded, validated file from a
 // fixed-origin HTTPS endpoint into a pre-approved absolute directory.
 //
-// This module is intentionally source-agnostic. The pixellab download path
-// (UUID + PNG -> map-objects/{id}/download) is one specific use of it; any
-// future adapter that needs the same defense-in-depth shape can layer on top
-// by supplying:
-//   - validateInput(input) -> { filename, ... }
-//   - buildUrl(input)      -> string
-//   - validateContent(bytes) -> void  (throws on rejection)
+// This module is intentionally source-agnostic. Adapters layer on top by
+// supplying three pure functions plus an `expectedContentType`:
+//   - validateInput(input)        -> { filename, ... }
+//   - buildUrl(input)             -> string  (caller-owned origin/host)
+//   - validateContent(bytes)      -> void    (throws on rejection)
+//   - expectedContentType         -> string  (e.g. "image/png")
+//
+// The adapters in `download-adapter.ts` compose this primitive from a
+// declarative config; the spec is compiled once at registration time.
 //
 // Defenses applied here (every caller inherits them):
 //   - configuredRoot must be absolute, non-network, no dot segments.
@@ -22,8 +24,8 @@
 //     the inode obtained by our exclusive open.
 //   - fetch: GET only, `redirect: "error"`, `credentials: "omit"`, signal
 //     aborts on caller cancellation OR the configurable timeout.
-//   - response: HTTP 200, `image/png`-shaped content-type (or whatever the
-//     caller advertises), streamed size cap of MAX_BYTES (1 MiB by default).
+//   - response: HTTP 200, exact-match expected content-type, streamed size
+//     cap of MAX_BYTES (1 MiB by default).
 //   - payload is passed to the caller-supplied validator before any write.
 //   - generic file-tool hooks are NOT invoked for this download — the
 //     executor itself performs stricter checks than the generic hook.
@@ -39,10 +41,7 @@ export const SAFE_DOWNLOAD_TIMEOUT_MS = 30_000;
  * Returned shape from a caller-supplied `validateInput`. The only required
  * field is `filename`; everything else is opaque to this primitive and is
  * forwarded to `buildUrl`. Keeping the contract minimal here means each
- * adapter (pixellab, future ones) keeps its own input schema.
- *
- * Adapters should narrow this through a generic parameter (`SafeDownloadSpec<MyInput>`)
- * so they can use their own validated type end-to-end without `unknown` casts.
+ * adapter keeps its own input schema.
  */
 export interface SafeDownloadInput {
   filename: string;
@@ -50,9 +49,8 @@ export interface SafeDownloadInput {
 }
 
 /**
- * Adapter-supplied behavior. The primitive composes these three pure
- * functions with its own filesystem/network defenses; nothing else leaks
- * across the seam.
+ * Adapter-supplied behavior. The primitive composes these pieces with its
+ * own filesystem/network defenses; nothing else leaks across the seam.
  */
 export interface SafeDownloadSpec<TInput extends SafeDownloadInput = SafeDownloadInput> {
   /** Strict input validation. Throws on any malformed input. */
@@ -61,6 +59,11 @@ export interface SafeDownloadSpec<TInput extends SafeDownloadInput = SafeDownloa
   buildUrl(input: TInput): string;
   /** Validate the downloaded bytes. Throws on rejection. */
   validateContent(bytes: Uint8Array): void;
+  /**
+   * Exact content-type (lowercased, parameter-stripped) the response must
+   * carry. Anything else is rejected before the byte validator runs.
+   */
+  expectedContentType: string;
 }
 
 export interface SafeDownloadDependencies {
@@ -121,7 +124,7 @@ export async function safeDownloadFile<TInput extends SafeDownloadInput>(
       credentials: "omit",
       signal,
     });
-    bytes = await readBoundedResponse(response);
+    bytes = await readBoundedResponse(response, spec.expectedContentType);
     signal.throwIfAborted();
     spec.validateContent(bytes);
   } finally {
@@ -223,10 +226,13 @@ async function samePathStats(
   }
 }
 
-async function readBoundedResponse(response: Response): Promise<Uint8Array> {
+async function readBoundedResponse(
+  response: Response,
+  expectedContentType: string,
+): Promise<Uint8Array> {
   const contentType = response.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
   if (response.status !== 200) throw new Error(`Download returned HTTP ${response.status}`);
-  if (contentType !== "image/png")
+  if (contentType !== expectedContentType.toLowerCase())
     throw new Error(`Download returned unsupported content-type: ${contentType ?? "<missing>"}`);
   const declared = response.headers.get("content-length");
   if (declared !== null && (!/^\d+$/.test(declared) || Number(declared) > SAFE_DOWNLOAD_MAX_BYTES))

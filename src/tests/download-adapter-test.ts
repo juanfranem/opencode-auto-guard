@@ -1,0 +1,262 @@
+// download-adapter-test.ts
+//
+// Adversarial tests for `compileDownloadAdapter`. These cover the
+// boundary between a user-supplied JSON config and the safe-download
+// spec the runtime consumes. Anything that escapes this seam is a
+// bug; the spec the compiler yields MUST be safe to execute even
+// when fed hostile inputs.
+
+import { compileDownloadAdapter, type DownloadAdapterConfig } from "../download-adapter";
+
+let pass = 0;
+let fail = 0;
+const ok = (name: string, condition: boolean): void => {
+  if (condition) {
+    pass++;
+    console.log(`  ✓ ${name}`);
+  } else {
+    fail++;
+    console.log(`  ✗ ${name}`);
+  }
+};
+
+const basePixellab: DownloadAdapterConfig = {
+  enabled: true,
+  root: "/tmp/adapter",
+  host: "api.pixellab.ai",
+  pathTemplate: "/mcp/{collection}/{objectId}/download",
+  expectedContentType: "image/png",
+  contentValidator: "png",
+  fields: {
+    objectId: "uuid",
+    collection: { enum: ["map-objects", "images"] },
+  },
+};
+
+try {
+  // ---- happy path ----
+  {
+    const compiled = compileDownloadAdapter(basePixellab);
+    const url = compiled.spec.buildUrl({
+      filename: "a.png",
+      objectId: "123e4567-e89b-12d3-a456-426614174000",
+      collection: "map-objects",
+    } as never);
+    ok(
+      "compiles canonical pixellab URL",
+      url ===
+        "https://api.pixellab.ai/mcp/map-objects/123e4567-e89b-12d3-a456-426614174000/download",
+    );
+  }
+  {
+    const compiled = compileDownloadAdapter(basePixellab);
+    const url = compiled.spec.buildUrl({
+      filename: "a.png",
+      objectId: "123e4567-e89b-12d3-a456-426614174000",
+      collection: "images",
+    } as never);
+    ok(
+      "collection=images produces /images/ URL",
+      url === "https://api.pixellab.ai/mcp/images/123e4567-e89b-12d3-a456-426614174000/download",
+    );
+  }
+
+  // ---- input validation ----
+  {
+    const compiled = compileDownloadAdapter(basePixellab);
+    ok(
+      "accepts valid input",
+      (() => {
+        try {
+          compiled.spec.validateInput({
+            filename: "asset_1.png",
+            objectId: "123e4567-e89b-12d3-a456-426614174000",
+            collection: "map-objects",
+          });
+          return true;
+        } catch {
+          return false;
+        }
+      })(),
+    );
+    for (const bad of [
+      null,
+      undefined,
+      "string",
+      7,
+      [],
+      { objectId: "123e4567-e89b-12d3-a456-426614174000" }, // missing filename + collection
+      {
+        filename: "../escape.png",
+        objectId: "123e4567-e89b-12d3-a456-426614174000",
+        collection: "map-objects",
+      },
+      {
+        filename: "a.png",
+        objectId: "https://evil.test/123e4567-e89b-12d3-a456-426614174000",
+        collection: "map-objects",
+      },
+      {
+        filename: "A.png",
+        objectId: "123e4567-e89b-12d3-a456-426614174000",
+        collection: "map-objects",
+      },
+      {
+        filename: "a.png",
+        objectId: "123e4567-e89b-12d3-a456-426614174000",
+        collection: "images",
+        extra: 1,
+      },
+    ]) {
+      let rejected = false;
+      try {
+        compiled.spec.validateInput(bad);
+      } catch {
+        rejected = true;
+      }
+      ok("validateInput rejects malformed input", rejected);
+    }
+  }
+
+  // ---- host/path template defense ----
+  for (const badHost of [
+    "",
+    "API.PIXELLAB.AI", // uppercase
+    "api pixellab ai",
+    "api.pixellab.ai:8080",
+    "user@api.pixellab.ai",
+    "https://api.pixellab.ai",
+    "/api.pixellab.ai",
+    1,
+    {},
+  ]) {
+    let rejected = false;
+    try {
+      compileDownloadAdapter({ ...basePixellab, host: badHost as never });
+    } catch {
+      rejected = true;
+    }
+    ok(`host "${String(badHost)}" rejected at compile`, rejected);
+  }
+  for (const bad of [
+    "mcp/{collection}/{objectId}/download", // missing leading /
+    "/mcp/{collection}/{objectId}/download?evil=1",
+    "/mcp/{collection}/{objectId}/download#frag",
+    "/mcp//{objectId}/download",
+    "/mcp/{unknown}/{objectId}/download",
+    "/mcp/{collection}/download", // missing {objectId}
+    "/mcp/../etc/passwd",
+    1,
+  ]) {
+    let rejected = false;
+    try {
+      compileDownloadAdapter({ ...basePixellab, pathTemplate: bad as never });
+    } catch {
+      rejected = true;
+    }
+    ok(`pathTemplate ${String(bad)} rejected at compile`, rejected);
+  }
+
+  // ---- field shape ----
+  for (const bad of [
+    "uuid1",
+    "",
+    { enum: [] },
+    { enum: ["x", 1] },
+    { enum: ["valid-but-empty-ish", ""] },
+    1,
+    [],
+  ]) {
+    let rejected = false;
+    try {
+      compileDownloadAdapter({
+        ...basePixellab,
+        fields: { objectId: bad as never },
+      });
+    } catch {
+      rejected = true;
+    }
+    ok(`field shape ${JSON.stringify(bad)} rejected`, rejected);
+  }
+
+  // ---- content type / extension coupling ----
+  {
+    let rejected = false;
+    try {
+      compileDownloadAdapter({
+        ...basePixellab,
+        expectedContentType: "image/png; charset=binary",
+      });
+    } catch {
+      rejected = true;
+    }
+    ok("expectedContentType with parameters is normalized, not rejected", !rejected);
+  }
+  {
+    let rejected = false;
+    try {
+      compileDownloadAdapter({
+        ...basePixellab,
+        expectedContentType: "application/zip",
+      });
+    } catch {
+      rejected = true;
+    }
+    ok("unknown content type rejected at compile", rejected);
+  }
+
+  // ---- URL render rejects crafted field inputs that the shape regex
+  //      would otherwise pass. This is a belt-and-braces guard: even if a
+  //      future shape regex were looser than intended, render must
+  //      refuse to produce an URL fragment.
+  {
+    const compiled = compileDownloadAdapter(basePixellab);
+    let rejected = false;
+    try {
+      compiled.spec.buildUrl({
+        filename: "a.png",
+        objectId: "../etc/passwd", // would never survive validateInput
+        collection: "map-objects",
+      } as never);
+    } catch {
+      rejected = true;
+    }
+    ok("URL render rejects slashes inside a field value", rejected);
+  }
+  {
+    const compiled = compileDownloadAdapter(basePixellab);
+    let rejected = false;
+    try {
+      compiled.spec.buildUrl({
+        filename: "a.png",
+        objectId: "123e4567-e89b-12d3-a456-426614174000",
+        collection: "images?q=1",
+      } as never);
+    } catch {
+      rejected = true;
+    }
+    ok("URL render rejects ? inside a field value", rejected);
+  }
+
+  // ---- file extension uniqueness per content type ----
+  {
+    const compiled = compileDownloadAdapter(basePixellab);
+    let rejected = false;
+    try {
+      compiled.spec.validateInput({
+        filename: "a.jpg",
+        objectId: "123e4567-e89b-12d3-a456-426614174000",
+        collection: "map-objects",
+      });
+    } catch {
+      rejected = true;
+    }
+    ok("PNG adapter rejects .jpg filename", rejected);
+  }
+} catch (error) {
+  console.error("unexpected error:", error);
+  process.exit(2);
+}
+
+console.log(`\n${pass} passed, ${fail} failed`);
+if (fail) process.exit(1);

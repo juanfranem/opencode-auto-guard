@@ -24,6 +24,7 @@ const ok = (name: string, condition: boolean): void => {
 // adapter-agnostic: a single-key object carrying an opaque id and a
 // filename, returning an arbitrary text payload whose first byte is checked.
 const textSpec: SafeDownloadSpec<{ input: string; filename: string }> = {
+  expectedContentType: "image/png",
   validateInput(input): { input: string; filename: string } {
     if (input === null || typeof input !== "object" || Array.isArray(input))
       throw new Error("text input must be an object");

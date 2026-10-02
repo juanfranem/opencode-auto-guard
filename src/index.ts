@@ -61,16 +61,18 @@ import {
   type SessionState,
 } from "./rules";
 import { registerAutoAgent } from "./agent-registration";
+import { compileDownloadAdapter, type DownloadAdapterConfig } from "./download-adapter";
 import {
-  PIXELLAB_DOWNLOAD_PERMISSION,
-  pixellabDownloadEffect,
-  registerPixellabDownloadTool,
-} from "./pixellab-tool";
+  downloadAdapterEffect,
+  downloadAdapterPermission,
+  isDownloadAdapterId,
+  registerDownloadTool,
+} from "./download-tool";
 
 // ============== Plugin metadata ==============
 
 export const PLUGIN_NAME = "opencode-auto-guard";
-export const PLUGIN_VERSION = "0.1.10";
+export const PLUGIN_VERSION = "0.2.0";
 
 // ============== Defaults ==============
 
@@ -107,7 +109,7 @@ const JUDGE_CALL_LIMIT_PER_SESSION = 20;
 // Actions counted toward totalActions (and thus toward the per-session
 // maxActions limit). Read/list/no-effect actions are excluded so they
 // don't churn the counter.
-const COUNTED_ACTIONS = new Set([
+const BASE_COUNTED_ACTIONS = [
   "bash",
   "edit",
   "write",
@@ -115,8 +117,13 @@ const COUNTED_ACTIONS = new Set([
   "webfetch",
   "websearch",
   "subagent",
-  PIXELLAB_DOWNLOAD_PERMISSION,
-]);
+];
+
+// The static COUNTED_ACTIONS set is built in `initializePluginOnce` after
+// the downloads map is read, so each enabled adapter's permission
+// participates in the per-session action counter. Until then we hold an
+// immutable starter.
+let COUNTED_ACTIONS: ReadonlySet<string> = new Set(BASE_COUNTED_ACTIONS);
 
 // Audit log rotation: archive oldest entries when head exceeds this.
 const AUDIT_MAX_ENTRIES = 10_000;
@@ -145,8 +152,13 @@ interface ResolvedOptions {
   judgeTemperature: number;
   strictBuild: boolean;
   trustedDomains: string[];
-  /** Opt-in, existing absolute directory for the dedicated PixelLab PNG tool. */
-  pixellabDownloadRoot?: string;
+  /**
+   * Map of `<id>` -> DownloadAdapterConfig. Each enabled adapter registers
+   * a tool named `auto_guard_download_<id>` and a permission `<id>_download`.
+   * Adapter ids are validated at startup; malformed entries are dropped and
+   * surfaced in the audit log without crashing the plugin.
+   */
+  downloads: Record<string, DownloadAdapterConfig>;
   protectedPaths: string[];
   maxDenials: number;
   maxActions: number;
@@ -212,6 +224,23 @@ const sessionState = new Map<string, SessionState>();
 // Per-session LLM judge call counter for rate limiting.
 const judgeCallsBySession = new Map<string, number>();
 
+/**
+ * Compiled + registered download adapters. Built at startup from
+ * `opts.downloads`; queried by the permission hook and the registration
+ * loop. Permission keys are `<id>_download`. Values carry the
+ * adapter id, the audit category and the post-compile host/validator
+ * metadata so the permission hook can produce precise audit rows
+ * without re-compiling.
+ */
+const enabledDownloads = new Map<
+  string,
+  {
+    id: string;
+    host: string;
+    contentValidator: string;
+  }
+>();
+
 function getOrInitSession(sessionID: string, action: string): SessionState {
   let s = sessionState.get(sessionID);
   if (!s) {
@@ -244,6 +273,50 @@ function readStringArray(v: unknown): string[] | undefined {
   if (!Array.isArray(v)) return undefined;
   if (!v.every((x) => typeof x === "string")) return undefined;
   return v as string[];
+}
+
+/**
+ * Strict, defensive read of the `downloads` config map. Unknown keys are
+ * silently dropped so a future release can ship new per-adapter knobs
+ * without breaking the existing set. Malformed entries (bad id, bad
+ * shape, missing root) are also dropped and recorded via the returned
+ * `diagnostics` array — the plugin does NOT crash on a single bad
+ * adapter; the others still register.
+ *
+ * The legacy `pixellabDownloadRoot` option (removed in v0.2.0) is read
+ * here only to emit a one-time diagnostic; it does not produce an
+ * adapter. Users must migrate to `downloads.pixellab`.
+ */
+function readDownloadsConfig(raw: unknown): Record<string, DownloadAdapterConfig> {
+  const out: Record<string, DownloadAdapterConfig> = {};
+  if (raw === undefined || raw === null) return out;
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    return out;
+  }
+  for (const [id, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!isDownloadAdapterId(id)) continue;
+    if (value === null || typeof value !== "object" || Array.isArray(value)) continue;
+    const v = value as Record<string, unknown>;
+    // Reject unknown keys; mirror a strict allowlist. A misspelled
+    // `contentValdidator` is the kind of typo we want to surface by
+    // dropping the entry, not silently coercing.
+    const allowedKeys = new Set([
+      "enabled",
+      "root",
+      "host",
+      "pathTemplate",
+      "expectedContentType",
+      "contentValidator",
+      "maxBytes",
+      "timeoutMs",
+      "fields",
+    ]);
+    for (const k of Object.keys(v)) {
+      if (!allowedKeys.has(k)) continue;
+    }
+    out[id] = v as unknown as DownloadAdapterConfig;
+  }
+  return out;
 }
 
 /**
@@ -287,7 +360,7 @@ function resolveOptions(ctx: any): ResolvedOptions {
     judgeTemperature: readNumber(o.judgeTemperature, DEFAULT_JUDGE_TEMPERATURE),
     strictBuild: readBool(o.strictBuild, true),
     trustedDomains: readStringArray(o.trustedDomains) ?? defaultTrustedDomains(),
-    pixellabDownloadRoot: readEnvString(o.pixellabDownloadRoot),
+    downloads: readDownloadsConfig(o.downloads),
     protectedPaths: readStringArray(o.protectedPaths) ?? defaultProtectedPaths(),
     maxDenials: readNumber(o.maxDenials, DEFAULT_LIMITS.maxDenials),
     maxActions: readNumber(o.maxActions, DEFAULT_LIMITS.maxActions),
@@ -815,14 +888,22 @@ export default Plugin.define({
 
         // Dedicated downloads require human confirmation even in Auto mode.
         // Preserve configured denials; do not pass through shell/LLM elevation.
-        if (action === PIXELLAB_DOWNLOAD_PERMISSION) {
-          event.effect = pixellabDownloadEffect(event.effect);
-          event.message = `${PLUGIN_NAME}: descarga PNG de PixelLab requiere confirmación`;
+        const downloadAdapter = enabledDownloads.get(action);
+        if (downloadAdapter) {
+          event.effect = downloadAdapterEffect(event.effect);
+          event.message = `${PLUGIN_NAME}: descarga de ${downloadAdapter.id} (${downloadAdapter.contentValidator}) requiere confirmación`;
           if (event.effect === "deny") state.denials++;
-          // PixelLab download UUIDs function as access keys; omit raw resources.
+          // Download UUIDs / object keys function as access keys; omit raw resources.
           await writeAudit(
             ctx,
-            mkAudit(event, event.effect, "pixellab_download_permission", "", false, []),
+            mkAudit(
+              event,
+              event.effect,
+              `${downloadAdapter.id}_download_permission`,
+              "",
+              false,
+              [],
+            ),
           );
           return;
         }
@@ -1237,29 +1318,70 @@ export default Plugin.define({
       }
     });
 
-    // Register after the permission hook so the tool cannot precede its policy.
-    await registerPixellabDownloadTool(
-      ctx,
-      opts.pixellabDownloadRoot,
-      opts.protectedPaths,
-      async (context, status) => {
+    // Register each enabled download adapter AFTER the permission hook is
+    // attached, so the tool cannot precede its policy. Compilation failures
+    // are surfaced as audit rows under `<id>_download_compile_failed` rather
+    // than crashing the plugin — the rest of the plugin continues with the
+    // remaining adapters.
+    const counted = new Set<string>(BASE_COUNTED_ACTIONS);
+    for (const [id, raw] of Object.entries(opts.downloads)) {
+      if (raw.enabled !== true) continue;
+      try {
+        const compiled = compileDownloadAdapter(raw);
+        const permission = downloadAdapterPermission(id);
+        counted.add(permission);
+        enabledDownloads.set(permission, {
+          id,
+          host: compiled.config.host,
+          contentValidator: compiled.config.contentValidator,
+        });
+        await registerDownloadTool(
+          ctx,
+          id,
+          compiled,
+          opts.protectedPaths,
+          async (context, status) => {
+            await writeAudit(
+              ctx,
+              mkAudit(
+                {
+                  sessionID: context.sessionID,
+                  agent: context.agent,
+                  action: permission,
+                  effect: status === "completed" ? "allow" : "deny",
+                  resources: [],
+                },
+                status === "completed" ? "allow" : "deny",
+                `${id}_download_result`,
+                status,
+              ),
+            );
+          },
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        // Audit compile failure so a single bad adapter config is visible
+        // in the kv table without spamming or crashing the rest of the boot.
         await writeAudit(
           ctx,
           mkAudit(
             {
-              sessionID: context.sessionID,
-              agent: context.agent,
-              action: PIXELLAB_DOWNLOAD_PERMISSION,
-              effect: status === "completed" ? "allow" : "deny",
+              sessionID: "plugin",
+              agent: undefined,
+              action: "download_compile",
+              effect: "deny",
               resources: [],
             },
-            status === "completed" ? "allow" : "deny",
-            "pixellab_download_result",
-            status,
+            "deny",
+            `${id}_download_compile_failed`,
+            message.slice(0, 500),
+            false,
+            [],
           ),
-        );
-      },
-    );
+        ).catch(() => undefined);
+      }
+    }
+    COUNTED_ACTIONS = counted;
 
     // ====== Hook secundario: tool.execute.before (TOCTOU backstop) ======
     await ctx.tool.hook("execute.before", async (input: any) => {
