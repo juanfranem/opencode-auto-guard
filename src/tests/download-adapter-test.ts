@@ -33,6 +33,21 @@ const basePixellab: DownloadAdapterConfig = {
   },
 };
 
+// Backward-compat: v0.2.x shipped with a `{ shape: ... }` wrapper that
+// the user (and the README) documented. The v0.2.2+ compiler unwraps it.
+const wrappedPixellab = {
+  enabled: true,
+  root: "/tmp/adapter",
+  host: "api.pixellab.ai",
+  pathTemplate: "/mcp/{collection}/{objectId}/download",
+  expectedContentType: "image/png",
+  contentValidator: "png",
+  fields: {
+    objectId: { shape: "uuid" },
+    collection: { shape: { enum: ["map-objects", "images"] } },
+  },
+} as unknown as DownloadAdapterConfig;
+
 try {
   // ---- happy path ----
   {
@@ -118,7 +133,34 @@ try {
     }
   }
 
-  // ---- host/path template defense ----
+  // ---- wrapped shape form (backward compat from v0.2.x README) ----
+  {
+    const compiled = compileDownloadAdapter(wrappedPixellab);
+    const url = compiled.spec.buildUrl({
+      filename: "a.png",
+      objectId: "123e4567-e89b-12d3-a456-426614174000",
+      collection: "map-objects",
+    } as never);
+    ok(
+      "wrapped {shape: ...} form compiles to the same URL",
+      url ===
+        "https://api.pixellab.ai/mcp/map-objects/123e4567-e89b-12d3-a456-426614174000/download",
+    );
+  }
+  {
+    let rejected = false;
+    try {
+      compileDownloadAdapter({
+        ...wrappedPixellab,
+        fields: {
+          objectId: { shape: "uuid", extra: "ignored" } as never,
+        },
+      });
+    } catch {
+      rejected = true;
+    }
+    ok("wrapped form rejects extra fields besides shape", rejected);
+  }
   for (const badHost of [
     "",
     "API.PIXELLAB.AI", // uppercase
@@ -252,6 +294,35 @@ try {
       rejected = true;
     }
     ok("PNG adapter rejects .jpg filename", rejected);
+  }
+
+  // ---- wrapped shape form (backward compat from v0.2.x README) ----
+  {
+    const compiled = compileDownloadAdapter(wrappedPixellab);
+    const url = compiled.spec.buildUrl({
+      filename: "a.png",
+      objectId: "123e4567-e89b-12d3-a456-426614174000",
+      collection: "map-objects",
+    } as never);
+    ok(
+      "wrapped {shape: ...} form compiles to the same URL",
+      url ===
+        "https://api.pixellab.ai/mcp/map-objects/123e4567-e89b-12d3-a456-426614174000/download",
+    );
+  }
+  {
+    let rejected = false;
+    try {
+      compileDownloadAdapter({
+        ...wrappedPixellab,
+        fields: {
+          objectId: { shape: "uuid", extra: "ignored" } as never,
+        },
+      });
+    } catch {
+      rejected = true;
+    }
+    ok("wrapped form rejects extra fields besides shape", rejected);
   }
 } catch (error) {
   console.error("unexpected error:", error);

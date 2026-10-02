@@ -197,8 +197,8 @@ PixelLab map-objects / edited-images:
       "expectedContentType": "image/png",
       "contentValidator": "png",
       "fields": {
-        "objectId":   { "shape": "uuid" },
-        "collection": { "shape": { "enum": ["map-objects", "images"] } }
+        "objectId":   "uuid",
+        "collection": { "enum": ["map-objects", "images"] }
       }
     }
   }
@@ -229,9 +229,9 @@ A second, non-PixelLab example — signed text manifest pack:
       "contentValidator": "text/plain",
       "maxBytes": 65536,
       "fields": {
-        "owner": { "shape": "slug" },
-        "repo":  { "shape": "slug" },
-        "tag":   { "shape": "slug" }
+        "owner": "slug",
+        "repo":  "slug",
+        "tag":   "slug"
       }
     }
   }
