@@ -129,6 +129,58 @@ defends against malicious tool calls that exploit over-permissive config.
   `guard:audit-archive-${date}-${n}` keys with a pointer record so the
   chain can be reconstructed across rotations.
 
+## Dedicated PixelLab downloader
+
+`pixellabDownloadRoot` enables an isolated tool; it does not introduce an exception
+to `HARD_DENY` or expand `trustedDomains`. Its permission action `pixellab_download`
+is always escalated to `ask` (an existing `deny` is preserved), bypassing neither
+session limits nor the confirmation boundary. Download outcomes are audited without
+recording the UUID/access-key or raw destination input.
+
+Input contains only a strict UUID and PNG basename. The URL is constructed as
+`https://api.pixellab.ai/mcp/map-objects/<UUID>/download`; arbitrary hosts, URLs,
+queries, fragments, headers, bodies, filename traversal and Windows device names
+cannot be expressed. GET uses `redirect: error`, `credentials: omit`, and a
+30-second network timeout. Streamed bytes are capped at 1 MiB regardless of headers.
+Only HTTP 200 `image/png` is accepted. PNG checks cover signature, header, dimensions
+up to 400 × 400, chunk bounds/CRCs/order and bounded decompression with scanline
+size/filter checks. Interlaced images are conservatively refused; this is not a
+general-purpose image decoder or malware scanner.
+
+The existing absolute destination directory must be user-owned and not accessible
+for modification by untrusted processes. Network/device roots, symlink ancestors
+and protected paths are refused. Directory identity is checked again after download
+and after opening the destination. Exclusive creation prevents overwriting any
+existing target, including a file another download created concurrently. Failed
+writes clean up only the identity obtained by the exclusive open, never a prior file.
+
+These are defense-in-depth filesystem checks, not OS sandboxing: a privileged or
+hostile local process able to rename directory ancestors between syscalls is outside
+the guarantee. Symlinks/junctions, canonical path and inode identity differences are
+checked; the plugin does not enumerate every Windows reparse-point tag. Use an
+ordinary local directory rather than virtual/cloud-backed storage. Only the network
+phase has a deadline; OS filesystem calls are not forcibly terminated with a racing
+timer, which could leave writes running after cleanup. The executor performs stricter
+path checks than the generic file-tool hook, so the generic `execute.before` hook is
+not used for this tool. Newer tool contexts expose a cancellation signal; older SDKs retain
+the bounded timeout but cannot propagate session cancellation to the executor.
+Remote data is never executed. Users must review assets before integrating them.
+
+## Generic `safe-download` primitive
+
+`src/safe-download.ts` is the source-agnostic primitive (`safeDownloadFile`) that
+backs the pixellab adapter. It owns the cross-adapter defense contract: absolute
+non-network download root, no dot segments, symlink/junction-free ancestor walk,
+canonical path and inode identity check, fixed-origin GET with `redirect: error` and
+`credentials: omit`, configurable network timeout, streamed size cap (1 MiB by
+default), `image/png`-shaped content-type, exclusive `O_CREAT | O_EXCL` write,
+post-write identity recheck, and cleanup that only removes the inode our own open
+created. Any future adapter (asset packs, signed releases, etc.) reuses this primitive
+by supplying three pure functions: `validateInput`, `buildUrl`, and `validateContent`.
+The pixellab layer is exactly such an adapter — it adds UUID/PNG-basename input
+strictness, the fixed PixelLab URL, and the bounded PNG decoder, and calls
+`safeDownloadFile` with no other behavior.
+
 ## What is NOT covered
 
 - **Network-level exfiltration.** The plugin can only see what OpenCode

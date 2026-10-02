@@ -33,7 +33,9 @@
     "access": "public"
   },
   "scripts": {
-    "test": "bun src/tests/evasion-test.ts && bun src/tests/compact-test.ts && bun src/tests/agent-registration-test.ts && bun src/tests/jev-test.ts && bun src/tests/env-placeholder-test.ts",
+    "test": "bun src/tests/evasion-test.ts && bun src/tests/compact-test.ts && bun src/tests/agent-registration-test.ts && bun src/tests/jev-test.ts && bun src/tests/env-placeholder-test.ts && bun src/tests/safe-download-test.ts && bun src/tests/pixellab-download-test.ts && bun src/tests/pixellab-tool-test.ts",
+    "test:pixellab": "bun src/tests/safe-download-test.ts && bun src/tests/pixellab-download-test.ts && bun src/tests/pixellab-tool-test.ts",
+    "test:safe-download": "bun src/tests/safe-download-test.ts",
     "test:evasion": "bun src/tests/evasion-test.ts",
     "test:compact": "bun src/tests/compact-test.ts",
     "test:agent-registration": "bun src/tests/agent-registration-test.ts",
@@ -63,6 +65,9 @@
     "src/rules.ts",
     "src/judge-fast.ts",
     "src/agent-registration.ts",
+    "src/safe-download.ts",
+    "src/pixellab-download.ts",
+    "src/pixellab-tool.ts",
     "agents",
     "assets",
     "README.md",

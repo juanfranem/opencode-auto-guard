@@ -157,6 +157,7 @@ Then restart OpenCode — options are read once at startup.
 | `model` | string | default model | Model used by the LLM judge. Format: `provider/model`. |
 | `strictBuild` | bool | `true` | In `build` agent, force `ask` on `ALWAYS_ASK` patterns even if global config would allow. |
 | `trustedDomains` | string[] | built-in list | Hosts that pass through `webfetch` / `websearch` and shell network without asking. |
+| `pixellabDownloadRoot` | string | disabled | Existing absolute directory for the confirmation-required PixelLab PNG downloader. Does not relax shell rules or depend on `trustedDomains`. |
 | `protectedPaths` | string[] | plugin files | Absolute paths denied for `read` / `edit` / `write`. |
 | `maxDenials` | number | `3` | Session pauses after this many denials. |
 | `maxActions` | number | `250` | Session pauses after this many counted actions. |
@@ -165,6 +166,57 @@ Then restart OpenCode — options are read once at startup.
 | `compactOnContextGuard` | bool | `true` | Auto-invoke `compact-context-guard` when the context guard fires. |
 | `tempDir` | string | `~/.config/opencode/opencode-auto-guard/tmp` | Scratch directory for the `auto` agent (compiled artefacts, fixtures, logs). Created on startup. |
 | `pin` | string | unset | SHA-256 of `index.ts` + `rules.ts`. If set and mismatch → plugin disables. |
+
+### Safe PixelLab PNG downloads (opt-in)
+
+`Invoke-WebRequest` stays in `HARD_DENY`. Adding `api.pixellab.ai` to
+`trustedDomains` does not override that block. For approved map-object assets,
+enable the dedicated tool instead. Add this option to the existing plugin entry;
+do not replace your other options:
+
+The downloader is a thin adapter over the source-agnostic `safeDownloadFile`
+primitive in `src/safe-download.ts` (bounded fetch, identity-checked exclusive
+write, exhaustive path / symlink / ancestor defenses). Any future download
+adapter — map tiles, asset packs, signed releases — reuses the same primitive
+by supplying its own `validateInput`, `buildUrl`, and `validateContent`.
+
+```jsonc
+"pixellabDownloadRoot": "C:/Users/bjfem/Desktop/workspace/kingdom-simulator/src/assets/icons/stats"
+```
+
+Create the directory yourself first, keep it owned by you, and restart OpenCode.
+The tool is exposed as `auto_guard_download_pixellab_png` (namespace `auto_guard`
+in Code Mode). Input:
+
+```json
+{
+  "objectId": "a4f416f2-0749-4b9a-90e3-b05c9b238819",
+  "filename": "economy.png"
+}
+```
+
+Every call requests confirmation, even in Auto mode or with an `allow` rule;
+an existing `deny` remains a denial. Session limits still apply. The tool accepts
+only a UUID and a lowercase PNG basename. It constructs the exact PixelLab HTTPS
+download URL internally, performs GET with no redirects or credentials, limits
+network time to 30 seconds and response size to 1 MiB, validates non-interlaced
+PNG data (up to 400 × 400, chunk CRCs and bounded inflated scanlines), and creates
+the file exclusively.
+It never overwrites an existing file. Root/path checks reject protected paths
+and symlink ancestors. No shell commands, arbitrary URLs, headers or paths are
+accepted as input. This downloads existing assets; it does not generate them.
+
+The directory must already exist, be absolute, and not be writable by untrusted
+users/processes. Cross-platform filesystem checks cannot sandbox a hostile local
+process that can replace directory ancestors concurrently. Approval is not an
+assertion that remote content is trustworthy; do not execute downloaded files.
+
+When developing a plugin configured with a Git package reference, uncommitted
+working-tree changes are not loaded from the cached Git dependency. To test this
+implementation, manually point the plugin `package` at the local directory (for
+example `C:/Users/bjfem/Desktop/workspace/opencode-auto-guard`) and restart. Keep
+other options, including any integrity pin, intact and review/update the pin
+through your normal trusted procedure if necessary.
 
 <details>
 <summary><strong>Fast structured judge (Jev) — advanced</strong></summary>
