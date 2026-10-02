@@ -4,6 +4,22 @@ All notable changes to **opencode-auto-guard** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- Opt-in `pixellabDownloadRoot` and dedicated `auto_guard_download_pixellab_png` tool:
+  fixed-origin PNG downloads, confirmation required, no redirects, bounded responses,
+  path validation and exclusive no-overwrite creation. General shell blocks remain intact.
+- Generic `src/safe-download.ts` primitive (`safeDownloadFile`) behind the pixellab
+  adapter: bounded fetch, identity-checked exclusive write, cancellation handling, and
+  exhaustive root / symlink / ancestor / protected-path defenses. Adapter-agnostic —
+  future download tools (asset packs, map tiles, signed releases) layer on top by
+  supplying `validateInput`, `buildUrl`, and `validateContent`. Pixellab is now a
+  thin adapter that composes this primitive.
+- Adversarial downloader and tool registration/permission regression tests, plus a
+  `safe-download-test.ts` suite covering the generic primitive with a fake spec.
+
 ## [0.1.3] — 2026-09-22
 
 ### Added

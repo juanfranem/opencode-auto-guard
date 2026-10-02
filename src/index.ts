@@ -61,6 +61,11 @@ import {
   type SessionState,
 } from "./rules";
 import { registerAutoAgent } from "./agent-registration";
+import {
+  PIXELLAB_DOWNLOAD_PERMISSION,
+  pixellabDownloadEffect,
+  registerPixellabDownloadTool,
+} from "./pixellab-tool";
 
 // ============== Plugin metadata ==============
 
@@ -110,6 +115,7 @@ const COUNTED_ACTIONS = new Set([
   "webfetch",
   "websearch",
   "subagent",
+  PIXELLAB_DOWNLOAD_PERMISSION,
 ]);
 
 // Audit log rotation: archive oldest entries when head exceeds this.
@@ -139,6 +145,8 @@ interface ResolvedOptions {
   judgeTemperature: number;
   strictBuild: boolean;
   trustedDomains: string[];
+  /** Opt-in, existing absolute directory for the dedicated PixelLab PNG tool. */
+  pixellabDownloadRoot?: string;
   protectedPaths: string[];
   maxDenials: number;
   maxActions: number;
@@ -279,6 +287,7 @@ function resolveOptions(ctx: any): ResolvedOptions {
     judgeTemperature: readNumber(o.judgeTemperature, DEFAULT_JUDGE_TEMPERATURE),
     strictBuild: readBool(o.strictBuild, true),
     trustedDomains: readStringArray(o.trustedDomains) ?? defaultTrustedDomains(),
+    pixellabDownloadRoot: readEnvString(o.pixellabDownloadRoot),
     protectedPaths: readStringArray(o.protectedPaths) ?? defaultProtectedPaths(),
     maxDenials: readNumber(o.maxDenials, DEFAULT_LIMITS.maxDenials),
     maxActions: readNumber(o.maxActions, DEFAULT_LIMITS.maxActions),
@@ -804,6 +813,20 @@ export default Plugin.define({
           return;
         }
 
+        // Dedicated downloads require human confirmation even in Auto mode.
+        // Preserve configured denials; do not pass through shell/LLM elevation.
+        if (action === PIXELLAB_DOWNLOAD_PERMISSION) {
+          event.effect = pixellabDownloadEffect(event.effect);
+          event.message = `${PLUGIN_NAME}: descarga PNG de PixelLab requiere confirmación`;
+          if (event.effect === "deny") state.denials++;
+          // PixelLab download UUIDs function as access keys; omit raw resources.
+          await writeAudit(
+            ctx,
+            mkAudit(event, event.effect, "pixellab_download_permission", "", false, []),
+          );
+          return;
+        }
+
         // Self-protection: deny any access to plugin files.
         if (
           action === "read" ||
@@ -1213,6 +1236,30 @@ export default Plugin.define({
         // fail-closed: never modify the effect on error
       }
     });
+
+    // Register after the permission hook so the tool cannot precede its policy.
+    await registerPixellabDownloadTool(
+      ctx,
+      opts.pixellabDownloadRoot,
+      opts.protectedPaths,
+      async (context, status) => {
+        await writeAudit(
+          ctx,
+          mkAudit(
+            {
+              sessionID: context.sessionID,
+              agent: context.agent,
+              action: PIXELLAB_DOWNLOAD_PERMISSION,
+              effect: status === "completed" ? "allow" : "deny",
+              resources: [],
+            },
+            status === "completed" ? "allow" : "deny",
+            "pixellab_download_result",
+            status,
+          ),
+        );
+      },
+    );
 
     // ====== Hook secundario: tool.execute.before (TOCTOU backstop) ======
     await ctx.tool.hook("execute.before", async (input: any) => {
