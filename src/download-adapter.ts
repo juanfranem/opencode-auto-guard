@@ -205,21 +205,48 @@ export function compileDownloadAdapter(config: DownloadAdapterConfig): CompiledD
 
 // ===== compile-shape + matching =====
 
-function compileShape(shape: FieldShapeSpec): FieldShapeSpec {
+function compileShape(shape: unknown): FieldShapeSpec {
+  // Accept both flat and wrapped shapes so existing user configs keep
+  // working. The canonical form documented in the README is the flat
+  // shape: `"objectId": "uuid"` or `"collection": { "enum": [...] }`.
+  // The wrapped form `"objectId": { "shape": "uuid" }` is tolerated for
+  // backward compatibility with v0.2.x migrations and is unwrapped here.
   if (typeof shape === "string") {
     if (!(shape in SHAPE_PATTERNS)) throw new Error(`Unknown field shape "${shape}"`);
-    return shape;
+    return shape as FieldShapeName;
+  }
+  if (shape === null || typeof shape !== "object" || Array.isArray(shape)) {
+    throw new Error(
+      `Invalid field shape ${JSON.stringify(shape)}: expected a shape name (uuid|num|slug|hex32|hex64) or { enum: [...] }`,
+    );
+  }
+  let rawShape: unknown = shape;
+  if ("shape" in (shape as Record<string, unknown>)) {
+    const wrapper = shape as Record<string, unknown>;
+    if (Object.keys(wrapper).length !== 1) {
+      throw new Error(
+        `Wrapped field shape must have exactly one "shape" key, got ${JSON.stringify(wrapper)}`,
+      );
+    }
+    rawShape = wrapper.shape;
+  }
+  if (typeof rawShape === "string") {
+    if (!(rawShape in SHAPE_PATTERNS)) throw new Error(`Unknown field shape "${rawShape}"`);
+    return rawShape as FieldShapeName;
   }
   if (
-    !shape ||
-    typeof shape !== "object" ||
-    !Array.isArray(shape.enum) ||
-    shape.enum.length === 0 ||
-    !shape.enum.every((v) => typeof v === "string" && v.length > 0 && /^[a-z0-9-]+$/.test(v))
+    rawShape === null ||
+    typeof rawShape !== "object" ||
+    Array.isArray(rawShape) ||
+    !Array.isArray((rawShape as { enum?: unknown[] }).enum) ||
+    (rawShape as { enum: unknown[] }).enum.length === 0 ||
+    !(rawShape as { enum: unknown[] }).enum.every(
+      (v) => typeof v === "string" && v.length > 0 && /^[a-z0-9-]+$/.test(v),
+    )
   )
     throw new Error("enum shape must be a non-empty list of [a-z0-9-]+ values");
   // Snapshot so callers cannot mutate after compilation.
-  return { enum: Object.freeze([...shape.enum]) };
+  return { enum: Object.freeze([...(rawShape as { enum: string[] }).enum]) };
 }
 
 function shapeMatches(shape: FieldShapeSpec, value: string): boolean {
