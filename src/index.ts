@@ -1318,6 +1318,19 @@ export default Plugin.define({
       }
     });
 
+    // Declare the `auto_guard` namespace exactly once so multiple adapter
+    // registrations cannot re-declare (and possibly flip) the namespace
+    // description mid-flight. The transform callback also returns the
+    // mutated editor back, which is the safe pattern for OpenCode v2 SDKs
+    // that capture the editor proxy by reference rather than by closure.
+    await ctx.tool.transform((editor) => {
+      editor.namespace({
+        name: "auto_guard",
+        description: "Constrained, confirmation-required guard operations.",
+      });
+      return editor;
+    });
+
     // Register each enabled download adapter AFTER the permission hook is
     // attached, so the tool cannot precede its policy. Compilation failures
     // are surfaced as audit rows under `<id>_download_compile_failed` rather
@@ -1325,7 +1338,13 @@ export default Plugin.define({
     // remaining adapters.
     const counted = new Set<string>(BASE_COUNTED_ACTIONS);
     for (const [id, raw] of Object.entries(opts.downloads)) {
-      if (raw.enabled !== true) continue;
+      if (raw.enabled !== true) {
+        console.log(`[opencode-auto-guard] ${id}: enabled=${raw.enabled ?? false} (skipped)`);
+        continue;
+      }
+      console.log(
+        `[opencode-auto-guard] ${id}: compiling host=${raw.host} template=${raw.pathTemplate} validator=${raw.contentValidator}`,
+      );
       try {
         const compiled = compileDownloadAdapter(raw);
         const permission = downloadAdapterPermission(id);
@@ -1358,8 +1377,12 @@ export default Plugin.define({
             );
           },
         );
+        console.log(
+          `[opencode-auto-guard] ${id}: registered auto_guard_download_${id} (host=${compiled.config.host}, validator=${compiled.config.contentValidator})`,
+        );
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        console.error(`[opencode-auto-guard] ${id}: compile failed: ${message}`);
         // Audit compile failure so a single bad adapter config is visible
         // in the kv table without spamming or crashing the rest of the boot.
         await writeAudit(

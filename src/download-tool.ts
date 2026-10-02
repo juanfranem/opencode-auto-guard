@@ -45,10 +45,11 @@ export async function registerDownloadTool(
   const toolName = `download_${id}`;
   const permission = downloadAdapterPermission(id);
   await ctx.tool.transform((editor) => {
-    editor.namespace({
-      name: "auto_guard",
-      description: "Constrained, confirmation-required guard operations.",
-    });
+    // NOTE: editor.namespace is intentionally NOT called inside this
+    // transform — the namespace is declared once at boot by `index.ts`
+    // before iterating adapters, so multiple `registerDownloadTool`
+    // calls never re-declare it. Re-declaring can flip the namespace
+    // description mid-flight and confuse the LLM.
     // Build a description that mirrors the prior pixellab wording but
     // uses the adapter id so the LLM sees what it's about to do.
     const fieldLines = Object.keys(compiled.config.fields)
