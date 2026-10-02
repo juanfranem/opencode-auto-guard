@@ -26,8 +26,8 @@ export async function registerPixellabDownloadTool(
     editor.add({
       name: "download_pixellab_png",
       description:
-        "Download one approved PixelLab map-object PNG into the configured directory. " +
-        "Requires confirmation. Accepts an object UUID and a PNG basename only; " +
+        "Download one approved PixelLab map-object or edited-image PNG into the configured directory. " +
+        "Requires confirmation. Accepts a UUID, PNG basename and optional closed resource type; " +
         "never follows redirects or overwrites existing files. Does not generate assets.",
       input: {
         type: "object",
@@ -35,12 +35,18 @@ export async function registerPixellabDownloadTool(
           objectId: {
             type: "string",
             pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-            description: "PixelLab map-object UUID.",
+            description: "PixelLab map-object UUID, or image job UUID when resourceType is image.",
           },
           filename: {
             type: "string",
             pattern: "^[a-z][a-z0-9_-]{0,63}\\.png$",
             description: "Lowercase PNG basename, e.g. economy.png.",
+          },
+          resourceType: {
+            type: "string",
+            enum: ["map-object", "image"],
+            description:
+              "Fixed download collection. Defaults to map-object; use image for edited-image job UUIDs.",
           },
         },
         required: ["objectId", "filename"],

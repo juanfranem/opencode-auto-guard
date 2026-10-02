@@ -170,7 +170,7 @@ Then restart OpenCode — options are read once at startup.
 ### Safe PixelLab PNG downloads (opt-in)
 
 `Invoke-WebRequest` stays in `HARD_DENY`. Adding `api.pixellab.ai` to
-`trustedDomains` does not override that block. For approved map-object assets,
+`trustedDomains` does not override that block. For approved map-object or edited-image assets,
 enable the dedicated tool instead. Add this option to the existing plugin entry;
 do not replace your other options:
 
@@ -197,7 +197,7 @@ in Code Mode). Input:
 
 Every call requests confirmation, even in Auto mode or with an `allow` rule;
 an existing `deny` remains a denial. Session limits still apply. The tool accepts
-only a UUID and a lowercase PNG basename. It constructs the exact PixelLab HTTPS
+only a UUID, a lowercase PNG basename and an optional `resourceType` enum. It constructs the exact PixelLab HTTPS
 download URL internally, performs GET with no redirects or credentials, limits
 network time to 30 seconds and response size to 1 MiB, validates non-interlaced
 PNG data (up to 400 × 400, chunk CRCs and bounded inflated scanlines), and creates
@@ -205,6 +205,24 @@ the file exclusively.
 It never overwrites an existing file. Root/path checks reject protected paths
 and symlink ancestors. No shell commands, arbitrary URLs, headers or paths are
 accepted as input. This downloads existing assets; it does not generate them.
+
+For edited images returned by `get_image`, supply the **job UUID**, not the Creator
+gallery asset ID, and explicitly choose the image collection:
+
+```json
+{
+  "objectId": "acc48249-a91c-455d-8bfd-0f16a69fb2b5",
+  "filename": "king-worried.png",
+  "resourceType": "image"
+}
+```
+
+`resourceType` accepts only `map-object` or `image`; omission retains the original
+map-object behavior. The URL is fixed to `/mcp/map-objects/<UUID>/download` or
+`/mcp/images/<UUID>/download`, respectively, on the exact `api.pixellab.ai` HTTPS
+host. User-supplied URLs, path fragments and other collections remain rejected.
+Image mode uses the same confirmation and all filesystem/PNG/network protections.
+Restart OpenCode after upgrading the plugin to expose the new tool argument.
 
 The directory must already exist, be absolute, and not be writable by untrusted
 users/processes. Cross-platform filesystem checks cannot sandbox a hostile local

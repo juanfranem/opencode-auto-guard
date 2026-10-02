@@ -6,6 +6,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- PixelLab PNG downloader accepts optional `resourceType: "image"` for edited-image
+  job UUIDs, while preserving the map-object default, mandatory confirmation and
+  all shared safe-download protections. No arbitrary URLs or collection names.
+
 ### Added
 
 - Opt-in `pixellabDownloadRoot` and dedicated `auto_guard_download_pixellab_png` tool:

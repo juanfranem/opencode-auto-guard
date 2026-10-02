@@ -20,6 +20,7 @@ import {
 
 export interface PixellabDownloadInput extends SafeDownloadInput {
   objectId: string;
+  resourceType?: "map-object" | "image";
 }
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -32,7 +33,12 @@ export function validatePixellabDownloadInput(input: unknown): PixellabDownloadI
   }
   const value = input as Record<string, unknown>;
   const keys = Object.keys(value).sort();
-  if (keys.length !== 2 || keys[0] !== "filename" || keys[1] !== "objectId") {
+  if (
+    (keys.length !== 2 && keys.length !== 3) ||
+    keys[0] !== "filename" ||
+    keys[1] !== "objectId" ||
+    (keys.length === 3 && keys[2] !== "resourceType")
+  ) {
     throw new Error("Pixellab download input has unknown fields");
   }
   if (typeof value.objectId !== "string" || !UUID.test(value.objectId)) {
@@ -45,13 +51,28 @@ export function validatePixellabDownloadInput(input: unknown): PixellabDownloadI
   ) {
     throw new Error("Invalid Pixellab filename");
   }
-  return { objectId: value.objectId, filename: value.filename };
+  if (keys.length === 3 && value.resourceType !== "map-object" && value.resourceType !== "image") {
+    throw new Error("Invalid Pixellab resourceType");
+  }
+  return keys.length === 3
+    ? {
+        objectId: value.objectId,
+        filename: value.filename,
+        resourceType: value.resourceType as "map-object" | "image",
+      }
+    : { objectId: value.objectId, filename: value.filename };
 }
 
-export function buildPixellabDownloadUrl(objectId: string): string {
+export function buildPixellabDownloadUrl(
+  objectId: string,
+  resourceType: "map-object" | "image" = "map-object",
+): string {
   if (typeof objectId !== "string" || !UUID.test(objectId))
     throw new Error("Invalid Pixellab objectId");
-  return `https://api.pixellab.ai/mcp/map-objects/${objectId}/download`;
+  if (resourceType !== "map-object" && resourceType !== "image")
+    throw new Error("Invalid Pixellab resourceType");
+  const collection = resourceType === "image" ? "images" : "map-objects";
+  return `https://api.pixellab.ai/mcp/${collection}/${objectId}/download`;
 }
 
 // ===== PNG validation =====
@@ -171,7 +192,7 @@ function crc32(bytes: Uint8Array): number {
 
 const pixellabSpec: SafeDownloadSpec<PixellabDownloadInput> = {
   validateInput: validatePixellabDownloadInput,
-  buildUrl: (input) => buildPixellabDownloadUrl(input.objectId),
+  buildUrl: (input) => buildPixellabDownloadUrl(input.objectId, input.resourceType),
   validateContent: validatePixellabPng,
 };
 
