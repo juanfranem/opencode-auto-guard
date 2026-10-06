@@ -103,6 +103,51 @@ try {
   );
   ok("adapter-supplied URL builder runs", capturedUrl === "https://override.test/abc");
 
+  const bounded = okBody("x");
+  await safeDownloadFile({ input: "x", filename: "at-limit.txt" }, textSpec, root, [], {
+    ...deps(response(bounded)),
+    maxBytes: bounded.length,
+  });
+  ok(
+    "accepts exactly configured maxBytes",
+    (await fs.readFile(path.join(root, "at-limit.txt"))).length === bounded.length,
+  );
+  for (const r of [
+    response(bounded, { "content-type": "image/png", "content-length": String(bounded.length) }),
+    response(bounded),
+    response(bounded, { "content-type": "image/png", "content-length": "1" }),
+  ]) {
+    let rejected = false;
+    try {
+      await safeDownloadFile({ input: "x", filename: "over-limit.txt" }, textSpec, root, [], {
+        ...deps(r),
+        maxBytes: bounded.length - 1,
+      });
+    } catch {
+      rejected = true;
+    }
+    ok(
+      "configured maxBytes rejects declared or streamed excess",
+      rejected && !(await fs.stat(path.join(root, "over-limit.txt")).catch(() => undefined)),
+    );
+  }
+  for (const maxBytes of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, 1.5, 1048577]) {
+    let fetched = false;
+    let rejected = false;
+    try {
+      await safeDownloadFile({ input: "x", filename: "invalid-limit.txt" }, textSpec, root, [], {
+        maxBytes,
+        fetch: async () => {
+          fetched = true;
+          return response(bounded);
+        },
+      });
+    } catch {
+      rejected = true;
+    }
+    ok("invalid primitive maxBytes rejected before fetch", rejected && !fetched);
+  }
+
   for (const bad of [null, undefined, "string", 7, [1, 2], { input: "" }, { input: 1 }, {}]) {
     let rejected = false;
     try {

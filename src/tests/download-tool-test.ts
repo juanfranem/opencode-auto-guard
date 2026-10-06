@@ -51,6 +51,7 @@ const goodPng = Uint8Array.from(
 interface RegisteredTool {
   name: string;
   description: string;
+  input: { properties: Record<string, unknown>; required: string[]; additionalProperties: boolean };
   options: { namespace?: string; codemode?: boolean; permission?: string };
   execute: (input: unknown, context: any) => Promise<unknown>;
 }
@@ -90,6 +91,118 @@ try {
   ok("downloadAdapterEffect forces ask for allow", downloadAdapterEffect("allow") === "ask");
   ok("downloadAdapterEffect preserves deny", downloadAdapterEffect("deny") === "deny");
   ok("downloadAdapterEffect keeps ask", downloadAdapterEffect("ask") === "ask");
+
+  // ---- host mode schema and executor, without live network requests ----
+  {
+    const sandbox = await fs.mkdtemp(path.join(os.tmpdir(), "download-host-test-"));
+    const originalFetch = globalThis.fetch;
+    try {
+      const compiled = compileDownloadAdapter({
+        enabled: true,
+        host: "api.pixellab.ai",
+        root: sandbox,
+        maxBytes: 6,
+      });
+      const ctx = new CapturingCtx();
+      let auditedStatus: string | undefined;
+      await registerDownloadTool(ctx as never, "pixellab", compiled, [], async (_c, status) => {
+        auditedStatus = status;
+      });
+      const tool = ctx.tools[0];
+      ok(
+        "host schema requires filename and url",
+        tool.input.required.includes("url") && tool.input.required.includes("filename"),
+      );
+      ok(
+        "host schema declares url and rejects extras",
+        "url" in tool.input.properties && tool.input.additionalProperties === false,
+      );
+      ok(
+        "host description exposes exact-host restrictions",
+        tool.description.includes("api.pixellab.ai") &&
+          tool.description.includes("any path and query"),
+      );
+      const payload = new Uint8Array([80, 75, 3, 4, 0, 255]);
+      let fetched = 0;
+      let requestedUrl: string | undefined;
+      let requestedOptions: RequestInit | undefined;
+      globalThis.fetch = (async (url, options) => {
+        fetched++;
+        requestedUrl = String(url);
+        requestedOptions = options;
+        return new Response(payload, { headers: { "content-type": "application/zip" } });
+      }) as typeof fetch;
+      const url = "https://api.pixellab.ai/arbitrary/archive?index=0&token=a%2Fb";
+      const result = await tool.execute(
+        { url, filename: "pack.zip" },
+        { sessionID: "s", agent: "auto" },
+      );
+      ok(
+        "host executor writes arbitrary content with query preserved",
+        requestedUrl === url && (await fs.readFile(path.join(sandbox, "pack.zip"))).equals(payload),
+      );
+      ok(
+        "host executor keeps GET, no redirects, no credentials",
+        requestedOptions?.method === "GET" &&
+          requestedOptions.redirect === "error" &&
+          requestedOptions.credentials === "omit",
+      );
+      ok(
+        "host executor reports and audits success",
+        auditedStatus === "completed" &&
+          (result as { content: string }).content.includes("Saved file:"),
+      );
+      for (const bad of [
+        { url: "https://evil.test/file", filename: "other.zip" },
+        { url, filename: "../escape.zip" },
+        { filename: "other.zip" },
+        { url, filename: "other.zip", extra: 1 },
+        { url, filename: "pack.zip" }, // no overwrite
+      ]) {
+        const before = fetched;
+        let rejected = false;
+        try {
+          await tool.execute(bad, { sessionID: "s", agent: "auto" });
+        } catch {
+          rejected = true;
+        }
+        ok(
+          "host executor rejects unsafe/missing input or overwrite before fetch",
+          rejected && fetched === before && auditedStatus === "failed",
+        );
+      }
+      globalThis.fetch = (async () => new Response(payload)) as unknown as typeof fetch;
+      await tool.execute({ url, filename: "no_header.bin" }, { sessionID: "s", agent: "auto" });
+      ok(
+        "host mode accepts missing content-type",
+        (await fs.readFile(path.join(sandbox, "no_header.bin"))).equals(payload),
+      );
+      for (const response of [
+        new Response(payload, { status: 302, headers: { location: "https://evil.test/file" } }),
+        new Response(payload, { status: 404 }),
+        new Response(payload, { headers: { "content-length": "1048577" } }),
+        new Response(new Uint8Array(1048577)),
+        new Response(payload, { headers: { "content-length": "7" } }),
+        new Response(new Uint8Array(7)),
+      ]) {
+        globalThis.fetch = (async () => response) as unknown as typeof fetch;
+        let rejected = false;
+        try {
+          await tool.execute({ url, filename: "rejected.bin" }, { sessionID: "s", agent: "auto" });
+        } catch {
+          rejected = true;
+        }
+        const exists = await fs.access(path.join(sandbox, "rejected.bin")).then(
+          () => true,
+          () => false,
+        );
+        ok("host mode rejects invalid status or oversized response", rejected && !exists);
+      }
+    } finally {
+      globalThis.fetch = originalFetch;
+      await fs.rm(sandbox, { recursive: true, force: true });
+    }
+  }
 
   // ---- registration happy path ----
   {

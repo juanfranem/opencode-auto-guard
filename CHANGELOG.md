@@ -6,6 +6,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Apply configured adapter `maxBytes` to both declared content length and
+  streamed bytes instead of always using 1 MiB. The 1 MiB hard ceiling remains.
+
 ### Changed
 
 - PixelLab PNG downloader accepts optional `resourceType: "image"` for edited-image
@@ -14,6 +19,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Host-mode download adapters: configuring only `enabled`, `host` and `root`
+  accepts `{ url, filename }` for any HTTPS route/query on that exact host.
+  No content-type/content validation by default; optional constraints remain
+  available. Confirmation, no redirects, 1 MiB cap and safe exclusive writes
+  remain enforced. Existing template adapters retain strict behavior.
 - Opt-in `pixellabDownloadRoot` and dedicated `auto_guard_download_pixellab_png` tool:
   fixed-origin PNG downloads, confirmation required, no redirects, bounded responses,
   path validation and exclusive no-overwrite creation. General shell blocks remain intact.

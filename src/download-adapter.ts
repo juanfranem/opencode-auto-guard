@@ -9,8 +9,10 @@
 //
 // Security model recap (the config cannot weaken them):
 //   * The host is a single literal hostname (no scheme, port, path,
-//     userinfo). The compiled URL is `https://${host}${pathTemplate}`.
-//   * The path template is a literal `/path` with `{key}` placeholders.
+//     userinfo). Every URL is pinned to its HTTPS origin.
+//   * Without a path template, input is a full HTTPS URL pinned to the
+//     configured host, plus a safe basename. Any route/query is allowed.
+//   * In template mode, the path is a literal `/path` with `{key}` placeholders.
 //     Each placeholder key MUST correspond to a field declared in the
 //     config; unknown placeholders are rejected at compile time, missing
 //     placeholders are rejected at compile time. Empty placeholders or
@@ -39,7 +41,11 @@
 //                  config (e.g. ["map-objects", "images"]).
 
 import type { SafeDownloadInput, SafeDownloadSpec } from "./safe-download";
-import { type ContentValidatorName, validateContentByName } from "./content-validators";
+import {
+  type ContentValidatorName,
+  isContentValidatorName,
+  validateContentByName,
+} from "./content-validators";
 
 // ===== Public types =====
 
@@ -63,11 +69,11 @@ export interface DownloadAdapterConfig {
    * Empty placeholders (`{}`) and placeholder names not in `fields` are
    * rejected.
    */
-  pathTemplate: string;
-  /** Exact match required on the response `content-type` header. */
-  expectedContentType: string;
-  /** Named validator from `./content-validators`. */
-  contentValidator: ContentValidatorName;
+  pathTemplate?: string;
+  /** Exact response type; required in template mode, optional in host mode. */
+  expectedContentType?: string;
+  /** Named validator; required in template mode, defaults to none in host mode. */
+  contentValidator?: ContentValidatorName;
   /** Max body size in bytes. Default 1 MiB. Hard ceiling 1 MiB. */
   maxBytes?: number;
   /** Per-request network timeout in ms. Default 30s. Hard ceiling 60s. */
@@ -76,7 +82,7 @@ export interface DownloadAdapterConfig {
    * Input fields other than the always-present `filename`. Each becomes a
    * required input property AND a placeholder key in `pathTemplate`.
    */
-  fields: Record<string, FieldShapeSpec>;
+  fields?: Record<string, FieldShapeSpec>;
 }
 
 // ===== Compiled adapter =====
@@ -85,9 +91,10 @@ export interface CompiledDownloadAdapter<TInput extends SafeDownloadInput = Safe
   /** Spec the primitive consumes. */
   spec: SafeDownloadSpec<TInput>;
   /** Mirror of the config, after defaults applied. Useful for tool registration. */
-  config: Required<
-    Pick<DownloadAdapterConfig, "root" | "host" | "pathTemplate" | "expectedContentType">
-  > & {
+  config: Pick<DownloadAdapterConfig, "root" | "host"> & {
+    mode: "host" | "template";
+    pathTemplate?: string;
+    expectedContentType?: string;
     contentValidator: ContentValidatorName;
     maxBytes: number;
     timeoutMs: number;
@@ -115,7 +122,7 @@ const EXTENSIONS_FOR_CONTENT_TYPE: Record<string, readonly RegExp[]> = {
   "text/plain": [/^[a-z][a-z0-9_-]{0,63}\.txt$/],
 };
 
-const WINDOWS_DEVICE = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])\.(?:png|jpe?g|webp|txt)$/i;
+const WINDOWS_DEVICE = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i;
 
 const VALID_HOST =
   /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
@@ -130,15 +137,28 @@ const VALID_HOST_LABEL = /^(?=.{1,63}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
  */
 export function compileDownloadAdapter(config: DownloadAdapterConfig): CompiledDownloadAdapter {
   const host = requireValidHost(config.host);
-  const contentType = normalizeContentType(config.expectedContentType);
-  const contentValidator = config.contentValidator;
+  const hostMode = config.pathTemplate === undefined;
+  if (!hostMode && config.contentValidator === undefined)
+    throw new Error("contentValidator must be specified in template mode");
+  const contentType =
+    config.expectedContentType === undefined
+      ? undefined
+      : normalizeContentType(config.expectedContentType);
+  const contentValidator = config.contentValidator === undefined ? "none" : config.contentValidator;
+  if (!isContentValidatorName(contentValidator)) throw new Error("Unknown contentValidator");
   const maxBytes = clamp(config.maxBytes, DEFAULT_MAX_BYTES, 1, HARD_MAX_BYTES);
   const timeoutMs = clamp(config.timeoutMs, DEFAULT_TIMEOUT_MS, 100, HARD_MAX_TIMEOUT_MS);
 
-  if (typeof config.fields !== "object" || config.fields === null || Array.isArray(config.fields))
+  if (hostMode) {
+    if (config.fields !== undefined) throw new Error("Host-mode adapters must not declare fields");
+  } else if (
+    typeof config.fields !== "object" ||
+    config.fields === null ||
+    Array.isArray(config.fields)
+  )
     throw new Error("Adapter fields must be a plain object");
 
-  const fields = config.fields;
+  const fields = config.fields ?? {};
   const compiledFields: Record<string, FieldShapeSpec> = {};
   for (const [name, shape] of Object.entries(fields)) {
     if (!/^[a-z_][a-zA-Z0-9_]{0,31}$/.test(name))
@@ -146,9 +166,11 @@ export function compileDownloadAdapter(config: DownloadAdapterConfig): CompiledD
     compiledFields[name] = compileShape(shape);
   }
 
-  const pathTemplate = resolvePathTemplate(config.pathTemplate, Object.keys(compiledFields));
-  const filenamePatterns = EXTENSIONS_FOR_CONTENT_TYPE[contentType];
-  if (!filenamePatterns)
+  const pathTemplate = hostMode
+    ? undefined
+    : resolvePathTemplate(config.pathTemplate, Object.keys(compiledFields));
+  const filenamePatterns = contentType ? EXTENSIONS_FOR_CONTENT_TYPE[contentType] : undefined;
+  if ((!hostMode || contentType !== undefined) && !filenamePatterns)
     throw new Error(
       `expectedContentType "${contentType}" has no built-in filename extension; cannot compile adapter`,
     );
@@ -160,14 +182,33 @@ export function compileDownloadAdapter(config: DownloadAdapterConfig): CompiledD
         throw new Error("Download input must be an object");
       const v = input as Record<string, unknown>;
       const keys = Object.keys(v).sort();
-      const expected = ["filename", ...Object.keys(compiledFields).sort()].sort();
+      const expected = hostMode
+        ? ["filename", "url"]
+        : ["filename", ...Object.keys(compiledFields)];
+      expected.sort();
       if (keys.length !== expected.length || !keys.every((k, i) => k === expected[i])) {
         throw new Error("Download input has unknown or missing fields");
       }
       const filename = v.filename;
       if (typeof filename !== "string") throw new Error("Download input filename must be a string");
-      if (!filenamePatterns.some((re) => re.test(filename)) || WINDOWS_DEVICE.test(filename))
+      if (
+        (hostMode
+          ? !isGenericFilename(filename)
+          : !filenamePatterns?.some((re) => re.test(filename))) ||
+        WINDOWS_DEVICE.test(filename)
+      )
         throw new Error("Download input filename invalid");
+      if (hostMode) {
+        if (filenamePatterns && !filenamePatterns.some((re) => re.test(filename)))
+          throw new Error("Download input filename invalid");
+        if (
+          !Object.prototype.hasOwnProperty.call(v, "filename") ||
+          !Object.prototype.hasOwnProperty.call(v, "url")
+        )
+          throw new Error("Download input has unknown or missing fields");
+        if (typeof v.url !== "string") throw new Error("Download input url must be a string");
+        return { filename, url: validateHostUrl(v.url, host) } as SafeDownloadInput;
+      }
       const out: Record<string, string> = { filename };
       for (const [name, shape] of Object.entries(compiledFields)) {
         const value = v[name];
@@ -178,6 +219,7 @@ export function compileDownloadAdapter(config: DownloadAdapterConfig): CompiledD
       return out as SafeDownloadInput;
     },
     buildUrl(input: SafeDownloadInput): string {
+      if (hostMode) return validateHostUrl(input.url, host);
       const path = renderPathTemplate(pathTemplate, input as Record<string, string>);
       const url = new URL(`https://${host}${path}`);
       if (url.host !== host) throw new Error("Download URL host differs from declared");
@@ -193,6 +235,7 @@ export function compileDownloadAdapter(config: DownloadAdapterConfig): CompiledD
     config: {
       root: config.root,
       host,
+      mode: hostMode ? "host" : "template",
       pathTemplate,
       expectedContentType: contentType,
       contentValidator,
@@ -321,6 +364,52 @@ function normalizeContentType(value: unknown): string {
   const trimmed = value.split(";", 1)[0].trim().toLowerCase();
   if (trimmed.length === 0) throw new Error("expectedContentType must not be empty");
   return trimmed;
+}
+
+function isGenericFilename(filename: string): boolean {
+  return (
+    filename !== "." &&
+    filename !== ".." &&
+    !filename.endsWith(".") &&
+    filename.length <= 128 &&
+    /^[a-z0-9][a-z0-9_.-]*$/.test(filename) &&
+    !filename.includes("/") &&
+    !filename.includes("\\")
+  );
+}
+
+function validateHostUrl(raw: unknown, host: string): string {
+  if (typeof raw !== "string" || !/^https:\/\//i.test(raw))
+    throw new Error("Download URL must be an absolute HTTPS URL");
+  if (
+    /\s/.test(raw) ||
+    raw.includes("\\") ||
+    raw.includes("#") ||
+    [...raw].some((char) => char.charCodeAt(0) < 32 || char.charCodeAt(0) === 127)
+  )
+    throw new Error("Download URL contains forbidden characters");
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error("Download URL is invalid");
+  }
+  if (
+    parsed.protocol !== "https:" ||
+    parsed.hostname !== host ||
+    (parsed.port !== "" && parsed.port !== "443")
+  )
+    throw new Error("Download URL host differs from declared");
+  if (parsed.username !== "" || parsed.password !== "")
+    throw new Error("Download URL must not contain credentials");
+  if (
+    raw
+      .slice(raw.indexOf("://") + 3)
+      .split(/[/?]/, 1)[0]
+      .includes("@")
+  )
+    throw new Error("Download URL must not contain credentials");
+  return parsed.toString();
 }
 
 function clamp(value: unknown, fallback: number, min: number, max: number): number {

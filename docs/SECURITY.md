@@ -137,10 +137,26 @@ NOT introduce an exception to `HARD_DENY`, do NOT expand `trustedDomains`,
 and are always escalated to `ask` (an existing `deny` is preserved). They
 bypass neither session limits nor the confirmation boundary. Each call is
 audited under `<id>_download_permission` and `<id>_download_result`
-without recording UUIDs, slug keys, or raw destination input.
+without recording UUIDs, slug keys, source URLs, or raw destination input.
 
-The user-facing knobs are closed and small on purpose: a JSON config
-cannot invent a new code path. Inputs are restricted to a strict
+With only `enabled`, `host` and `root`, an adapter uses **host mode**:
+input is exactly `{ url, filename }`. Every GET path/query on that exact
+HTTPS host is authorized for download, subject to confirmation and shared
+protections. Other hosts, subdomains, non-default ports, credentials,
+fragments, raw whitespace/control characters and backslashes are rejected.
+URL building revalidates the host restriction. Filenames are safe lowercase
+basenames (max 128 characters); path traversal, trailing dots, alternate
+streams and Windows device names are rejected. Arbitrary extensions are
+allowed. Host mode does not expand shell or general web-fetch allowlists.
+
+Host mode defaults to **no content-type check and no content validation**.
+This is broader trust than template mode: malicious or executable content
+may be downloaded from an approved host. Approval is not content trust and
+does not authorize execution. Explicit `expectedContentType` and/or
+`contentValidator` constraints are still honored. Partial template configs
+with `fields` but no `pathTemplate` fail compilation, not silently broaden.
+
+Supplying `pathTemplate` selects **template mode**. Inputs are restricted to a strict
 key/value shape per field (`"uuid" | "num" | "slug" | "hex32" | "hex64"
 | { "enum": [...] }`); the regexes never match `/`, `?`, `#`, `\`,
 whitespace or NUL, and the LLM cannot smuggle a path fragment into a
@@ -163,14 +179,15 @@ shipped palette:
   walks chunks but does not decode entropy, so non-image data is
   rejected as "Unknown WebP chunk".
 - `text/plain`: strict UTF-8 (fatal decode), no NUL bytes.
-- `none`: identity; defers to `expectedContentType` + size cap.
+- `none`: identity; only the size cap and an optional `expectedContentType`
+  constrain content (host mode omits the type check by default).
 
 Adding a new validator is a code change shipped in the plugin; the
 config cannot. The defense contract that ALL content validators
 inherit:
 
-- `image/png`-shaped (or whichever `expectedContentType` the adapter
-  declared) content-type header — anything else is rejected.
+- When `expectedContentType` is declared, its content-type header is
+  required and anything else is rejected. Template mode requires this knob.
 - Streamed body capped at 1 MiB regardless of headers.
 - 30-second network timeout (configurable per adapter up to 60s).
 - GET only, `redirect: error`, `credentials: omit`.

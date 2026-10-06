@@ -49,6 +49,131 @@ const wrappedPixellab = {
 } as unknown as DownloadAdapterConfig;
 
 try {
+  // ---- host-only configuration ----
+  {
+    const minimal = { enabled: true, root: "/tmp/adapter", host: "api.pixellab.ai" };
+    const compiled = compileDownloadAdapter(minimal);
+    ok("minimal config selects host mode", compiled.config.mode === "host");
+    ok(
+      "host mode has no default content restrictions",
+      compiled.spec.expectedContentType === undefined,
+    );
+    compiled.spec.validateContent(new Uint8Array([0, 255, 1]));
+    for (const url of [
+      "https://api.pixellab.ai/",
+      "https://api.pixellab.ai/mcp/images/job/download?index=0",
+      "https://api.pixellab.ai/any/path/file.zip?token=a%2Fb&index=2&index=3",
+      "https://api.pixellab.ai:443/other?redirect=https%3A%2F%2Fexample.test",
+    ]) {
+      const valid = compiled.spec.validateInput({ filename: "asset.zip", url });
+      ok(`host mode accepts ${url}`, compiled.spec.buildUrl(valid) === new URL(url).toString());
+    }
+    for (const url of [
+      "http://api.pixellab.ai/file",
+      "https://evil.test/file",
+      "https://sub.api.pixellab.ai/file",
+      "https://api.pixellab.ai.evil.test/file",
+      "https://api.pixellab.ai:8443/file",
+      "https://user:pass@api.pixellab.ai/file",
+      "https://@api.pixellab.ai/file",
+      "https://api.pixellab.ai@evil.test/file",
+      "https://api.pixellab.ai/file#fragment",
+      "https://api.pixellab.ai/file#",
+      "https://api.pixellab.ai\\@evil.test/file",
+      " https://api.pixellab.ai/file",
+      "https://api.pixellab.ai/fi\nle",
+      "//api.pixellab.ai/file",
+      "/file",
+      "not a url",
+    ]) {
+      for (const method of ["validateInput", "buildUrl"] as const) {
+        let rejected = false;
+        try {
+          compiled.spec[method]({ filename: "asset.zip", url });
+        } catch {
+          rejected = true;
+        }
+        ok(`${method} rejects unsafe host URL ${JSON.stringify(url)}`, rejected);
+      }
+    }
+    const url = "https://api.pixellab.ai/file";
+    for (const filename of [
+      "asset.png",
+      "pack.zip",
+      "data.json",
+      "readme",
+      "0.bin",
+      "a-b_c.v2.tar.gz",
+    ]) {
+      ok(
+        `host mode accepts basename ${filename}`,
+        compiled.spec.validateInput({ filename, url }).filename === filename,
+      );
+    }
+    for (const bad of [
+      null,
+      [],
+      {},
+      { filename: "a.zip" },
+      { url },
+      { filename: "a.zip", url, extra: 1 },
+      ...[
+        "../a.zip",
+        "a/b.zip",
+        "a\\b.zip",
+        "CON.zip",
+        "con.zip",
+        "nul",
+        "com1.tar.gz",
+        "a.",
+        ".env",
+        "a b.zip",
+        "a:stream",
+        "a".repeat(129),
+      ].map((filename) => ({ filename, url })),
+    ]) {
+      let rejected = false;
+      try {
+        compiled.spec.validateInput(bad);
+      } catch {
+        rejected = true;
+      }
+      ok(`host mode rejects malformed input ${JSON.stringify(bad)}`, rejected);
+    }
+    for (const extra of [
+      { fields: {} },
+      { pathTemplate: null },
+      { pathTemplate: "" },
+      { pathTemplate: "/file" },
+      { expectedContentType: null },
+      { contentValidator: "bad" },
+      { contentValidator: null },
+    ]) {
+      let rejected = false;
+      try {
+        compileDownloadAdapter({ ...minimal, ...extra } as never);
+      } catch {
+        rejected = true;
+      }
+      ok(`partial/malformed config rejected ${JSON.stringify(extra)}`, rejected);
+    }
+    const constrained = compileDownloadAdapter({
+      ...minimal,
+      expectedContentType: "image/png",
+      contentValidator: "png",
+    });
+    ok(
+      "host mode honors explicit content type",
+      constrained.spec.expectedContentType === "image/png",
+    );
+    let rejected = false;
+    try {
+      constrained.spec.validateInput({ filename: "a.zip", url });
+    } catch {
+      rejected = true;
+    }
+    ok("host mode explicit content type restricts filename extension", rejected);
+  }
   // ---- happy path ----
   {
     const compiled = compileDownloadAdapter(basePixellab);

@@ -19,3 +19,4 @@ scripts/
 # past drafts, but they should never get committed — the canonical
 # copy of every PR body is in the GitHub PR conversation itself.
 PR_BODY_*.md
+docs/plans
