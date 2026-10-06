@@ -4,11 +4,11 @@
 // fixed-origin HTTPS endpoint into a pre-approved absolute directory.
 //
 // This module is intentionally source-agnostic. Adapters layer on top by
-// supplying three pure functions plus an `expectedContentType`:
+// supplying three pure functions plus an optional `expectedContentType`:
 //   - validateInput(input)        -> { filename, ... }
 //   - buildUrl(input)             -> string  (caller-owned origin/host)
 //   - validateContent(bytes)      -> void    (throws on rejection)
-//   - expectedContentType         -> string  (e.g. "image/png")
+//   - expectedContentType         -> string | undefined (e.g. "image/png")
 //
 // The adapters in `download-adapter.ts` compose this primitive from a
 // declarative config; the spec is compiled once at registration time.
@@ -24,7 +24,7 @@
 //     the inode obtained by our exclusive open.
 //   - fetch: GET only, `redirect: "error"`, `credentials: "omit"`, signal
 //     aborts on caller cancellation OR the configurable timeout.
-//   - response: HTTP 200, exact-match expected content-type, streamed size
+//   - response: HTTP 200, exact-match content-type when configured, streamed size
 //     cap of MAX_BYTES (1 MiB by default).
 //   - payload is passed to the caller-supplied validator before any write.
 //   - generic file-tool hooks are NOT invoked for this download — the
@@ -61,9 +61,9 @@ export interface SafeDownloadSpec<TInput extends SafeDownloadInput = SafeDownloa
   validateContent(bytes: Uint8Array): void;
   /**
    * Exact content-type (lowercased, parameter-stripped) the response must
-   * carry. Anything else is rejected before the byte validator runs.
+   * carry when configured. Omit for host mode with unrestricted response types.
    */
-  expectedContentType: string;
+  expectedContentType?: string;
 }
 
 export interface SafeDownloadDependencies {
@@ -72,6 +72,8 @@ export interface SafeDownloadDependencies {
   signal?: AbortSignal;
   /** Per-request network timeout in ms. Defaults to SAFE_DOWNLOAD_TIMEOUT_MS. */
   timeoutMs?: number;
+  /** Per-download byte budget, at most SAFE_DOWNLOAD_MAX_BYTES (1 MiB). */
+  maxBytes?: number;
 }
 
 export interface SafeDownloadResult {
@@ -87,6 +89,9 @@ export async function safeDownloadFile<TInput extends SafeDownloadInput>(
   dependencies: SafeDownloadDependencies = {},
 ): Promise<SafeDownloadResult> {
   const valid = spec.validateInput(input);
+  const maxBytes = dependencies.maxBytes ?? SAFE_DOWNLOAD_MAX_BYTES;
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > SAFE_DOWNLOAD_MAX_BYTES)
+    throw new Error("Download maxBytes must be an integer between 1 and 1048576");
   if (!path.isAbsolute(configuredRoot)) throw new Error("Download root must be absolute");
   if (configuredRoot.startsWith("\\\\") || configuredRoot.startsWith("//"))
     throw new Error("Network/device download roots are not allowed");
@@ -124,7 +129,7 @@ export async function safeDownloadFile<TInput extends SafeDownloadInput>(
       credentials: "omit",
       signal,
     });
-    bytes = await readBoundedResponse(response, spec.expectedContentType);
+    bytes = await readBoundedResponse(response, spec.expectedContentType, maxBytes);
     signal.throwIfAborted();
     spec.validateContent(bytes);
   } finally {
@@ -228,21 +233,22 @@ async function samePathStats(
 
 async function readBoundedResponse(
   response: Response,
-  expectedContentType: string,
+  expectedContentType: string | undefined,
+  maxBytes: number,
 ): Promise<Uint8Array> {
   const contentType = response.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase();
   if (response.status !== 200) throw new Error(`Download returned HTTP ${response.status}`);
-  if (contentType !== expectedContentType.toLowerCase())
+  if (expectedContentType !== undefined && contentType !== expectedContentType.toLowerCase())
     throw new Error(`Download returned unsupported content-type: ${contentType ?? "<missing>"}`);
   const declared = response.headers.get("content-length");
-  if (declared !== null && (!/^\d+$/.test(declared) || Number(declared) > SAFE_DOWNLOAD_MAX_BYTES))
+  if (declared !== null && (!/^\d+$/.test(declared) || Number(declared) > maxBytes))
     throw new Error("Download is too large");
   if (!response.body) throw new Error("Download has no body");
   const chunks: Uint8Array[] = [];
   let total = 0;
   for await (const chunk of response.body as AsyncIterable<Uint8Array>) {
     total += chunk.byteLength;
-    if (total > SAFE_DOWNLOAD_MAX_BYTES) throw new Error("Download is too large");
+    if (total > maxBytes) throw new Error("Download is too large");
     chunks.push(chunk);
   }
   const result = new Uint8Array(total);

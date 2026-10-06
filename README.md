@@ -238,8 +238,51 @@ A second, non-PixelLab example — signed text manifest pack:
 }
 ```
 
-The contract (security model is the same for every adapter; only the
-fields and the validator change):
+### Host mode: any route on one host
+
+Omit `pathTemplate`, `fields`, `expectedContentType` and `contentValidator`
+to allow any HTTPS path and query on the exact configured host:
+
+```jsonc
+{
+  "downloads": {
+    "pixellab": {
+      "enabled": true,
+      "root": "C:/Users/bjfem/Desktop/workspace/kingdom-simulator/src/assets",
+      "host": "api.pixellab.ai"
+    }
+  }
+}
+```
+
+Place `downloads` inside the plugin's `options`, as in the examples above.
+The same `auto_guard_download_pixellab` tool now accepts:
+
+```json
+{
+  "url": "https://api.pixellab.ai/mcp/images/a4f416f2-0749-4b9a-90e3-b05c9b238819/download?index=0",
+  "filename": "economy.png"
+}
+```
+
+Only the exact HTTPS host is allowed (default port 443); subdomains,
+other hosts, credentials and fragments are rejected. Query parameters
+are unrestricted. Redirects are never followed. The destination is still
+a safe lowercase basename under `root`, up to 128 characters, using letters,
+digits, dots, underscores and hyphens; it must start with a letter or digit.
+Paths, trailing dots and Windows device names are rejected. Any extension,
+or no extension, is accepted.
+
+**Host mode deliberately has no content-type check or content validation by
+default.** Any file content, including executable or malicious content, can
+be downloaded after confirmation (up to 1 MiB); download approval never
+authorizes execution. You may keep an explicit `expectedContentType` and/or
+`contentValidator` to restrict content. An explicit content type retains its
+built-in filename extension requirement. Do not leave `fields` behind when
+switching to host mode: partial template configurations are rejected.
+
+The contract (filesystem, network and confirmation protections apply to
+both modes):
 
 - `enabled` (default false): only `true` registers the tool. Set `false`
   to disable without removing the entry.
@@ -248,13 +291,18 @@ fields and the validator change):
   pick up changes.
 - `host` must be a single literal lowercase hostname (no scheme, port,
   path or userinfo). Anything else is rejected at startup.
-- `pathTemplate` is a literal `/path` with `{key}` placeholders. Each
+- When supplied, `pathTemplate` selects strict template mode and is a literal
+  `/path` with `{key}` placeholders (no query). Each
   placeholder MUST correspond to a field declared in `fields`; missing
   or unknown placeholders fail compilation.
-- `expectedContentType` is matched exactly on the response
-  `content-type` header. `contentValidator` runs after that.
+- In template mode, `expectedContentType`, `contentValidator` and `fields`
+  are required. The type is matched exactly on the response `content-type`
+  header; `contentValidator` runs after that. In host mode these content
+  restrictions are optional (`contentValidator` defaults to `none`).
 - `maxBytes` (default 1 MiB) and `timeoutMs` (default 30s, hard ceiling
   60s) bound the streamed body and the abort budget.
+  Set `"maxBytes": 524288` for a 512 KiB limit per download, in either mode.
+  The hard ceiling remains 1048576 bytes (1 MiB); larger values are clamped.
 - `fields` declare each input field by name, with its shape. Closed
   palette: `"uuid" | "num" | "slug" | "hex32" | "hex64" | { "enum": [...] }`.
   Shape regexes never match `/`, `?`, `#`, `\`, whitespace, or NUL —
@@ -268,8 +316,10 @@ fields and the validator change):
 
 Every call requests confirmation, even in Auto mode or with an `allow`
 rule; an existing `deny` remains a denial. Session limits still apply.
-No shell commands, arbitrary URLs, headers or paths are accepted as
-input. These tools download existing assets; they do not generate them.
+No shell commands, custom headers or destination paths are accepted as
+input. Host mode accepts full URLs only on the configured HTTPS host;
+template mode accepts only the declared fields. These tools download existing
+files; they do not generate them.
 Approval is not an assertion that remote content is trustworthy; do not
 execute downloaded files.
 

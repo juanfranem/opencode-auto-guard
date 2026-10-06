@@ -56,26 +56,38 @@ export async function registerDownloadTool(
       .map((n) => `\`${n}\``)
       .join(", ");
     const fieldClause = fieldLines ? `${fieldLines} and ` : "";
-    const description = `Download one approved ${id} asset into the configured directory. Requires confirmation. Accepts ${fieldClause}\`filename\`; every other input field is rejected. Never follows redirects or overwrites existing files. Does not generate assets.`;
+    const hostMode = compiled.config.mode === "host";
+    const description = hostMode
+      ? `Download one approved ${id} file into the configured directory. Requires confirmation. Accepts \`url\` (absolute HTTPS URL on exactly ${compiled.config.host}, any path and query, no credentials or fragments) and \`filename\` (safe lowercase basename, max 128 characters); every other input field is rejected. Never follows redirects or overwrites existing files. Does not generate or execute files. ${compiled.config.expectedContentType ? `Requires content-type ${compiled.config.expectedContentType}.` : "No content-type restriction."} Content validator: ${compiled.config.contentValidator}.`
+      : `Download one approved ${id} asset into the configured directory. Requires confirmation. Accepts ${fieldClause}\`filename\`; every other input field is rejected. Never follows redirects or overwrites existing files. Does not generate assets.`;
     editor.add({
       name: toolName,
       description,
       // The input shape is intentionally loose here; the adapter's
       // `validateInput` re-validates strictly. We still declare the
       // `filename` property so editor tooling and the SDK schema are
-      // useful; extra fields are allowed at the SDK level because the
-      // adapter drops them.
+      // useful. Template-mode fields are checked by the adapter at runtime;
+      // host mode declares its complete input schema here as well.
       input: {
         type: "object",
         properties: {
           filename: {
             type: "string",
-            description:
-              "Lowercase destination basename with the configured extension (.png/.jpg/.jpeg/.webp/.txt).",
+            description: hostMode
+              ? "Safe lowercase destination basename (letters, digits, dots, underscores, hyphens; max 128 characters). No paths, trailing dot or Windows device names."
+              : "Lowercase destination basename with the configured extension (.png/.jpg/.jpeg/.webp/.txt).",
           },
+          ...(hostMode
+            ? {
+                url: {
+                  type: "string" as const,
+                  description: `Absolute HTTPS URL on exactly ${compiled.config.host}. Any route/query; no credentials, fragments or non-default ports.`,
+                },
+              }
+            : {}),
         },
-        required: ["filename"],
-        additionalProperties: true,
+        required: hostMode ? ["filename", "url"] : ["filename"],
+        additionalProperties: !hostMode,
       },
       options: {
         namespace: "auto_guard",
@@ -93,11 +105,14 @@ export async function registerDownloadTool(
             compiled.spec,
             compiled.config.root,
             protectedPaths,
-            { signal, timeoutMs: compiled.config.timeoutMs },
+            { signal, timeoutMs: compiled.config.timeoutMs, maxBytes: compiled.config.maxBytes },
           );
           await audit(context, "completed");
           return {
-            content: `Saved ${compiled.config.contentValidator} asset: ${result.path} (${result.bytes} bytes).`,
+            content:
+              compiled.config.contentValidator === "none"
+                ? `Saved file: ${result.path} (${result.bytes} bytes).`
+                : `Saved ${compiled.config.contentValidator} asset: ${result.path} (${result.bytes} bytes).`,
           };
         } catch (error) {
           await audit(context, "failed");
